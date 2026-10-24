@@ -180,17 +180,41 @@ pub mod framing {
     }
 
     pub async fn recv<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Message> {
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
+        Reader::new(reader).recv().await
+    }
 
-        if len > 10 * 1024 * 1024 {
-            anyhow::bail!("Message too large: {} bytes", len);
+    /// Keeps partial frames across canceled receive futures.
+    pub struct Reader<R> {
+        stream: R,
+        buffer: Vec<u8>,
+    }
+
+    impl<R: AsyncReadExt + Unpin> Reader<R> {
+        pub fn new(stream: R) -> Self {
+            Self { stream, buffer: Vec::new() }
         }
 
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf).await?;
-        let msg: Message = serde_json::from_slice(&buf)?;
-        Ok(msg)
+        pub async fn recv(&mut self) -> Result<Message> {
+            self.read_to(4).await?;
+            let len = u32::from_be_bytes(self.buffer[..4].try_into().unwrap()) as usize;
+            if len > 10 * 1024 * 1024 {
+                anyhow::bail!("Message too large: {} bytes", len);
+            }
+            self.read_to(4 + len).await?;
+            let msg = serde_json::from_slice(&self.buffer[4..]);
+            self.buffer.clear();
+            Ok(msg?)
+        }
+
+        async fn read_to(&mut self, len: usize) -> Result<()> {
+            while self.buffer.len() < len {
+                let remaining = (len - self.buffer.len()) as u64;
+                // read_buf commits consumed bytes before yielding, unlike read_exact.
+                if (&mut self.stream).take(remaining).read_buf(&mut self.buffer).await? == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
+            }
+            Ok(())
+        }
     }
 }

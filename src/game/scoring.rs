@@ -61,7 +61,7 @@ pub fn matadors(declarer_cards: &[Card], game_type: GameType) -> (u32, bool) {
 /// Calculate the game value for a completed hand.
 pub fn game_value(
     contract: &Contract,
-    declarer_cards: &[Card], // all cards held by declarer (hand + skat + tricks)
+    declarer_cards: &[Card], // original declarer hand plus skat, excluding won tricks
     declarer_trick_points: u32,
     declarer_trick_count: u32,
     total_tricks: u32,
