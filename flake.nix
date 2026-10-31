@@ -14,7 +14,7 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ "x86_64-unknown-linux-musl" ];
+          targets = [ "x86_64-unknown-linux-musl" "wasm32-unknown-unknown" ];
         };
       in
       {
@@ -25,6 +25,8 @@
             pkgs.pkg-config
             pkgs.python3
             pkgs.sqlite
+            pkgs.wasm-bindgen-cli
+            pkgs.nodejs
           ];
         };
 

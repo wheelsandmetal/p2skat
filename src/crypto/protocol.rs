@@ -13,6 +13,7 @@ pub fn encrypt_and_shuffle(cards: &[BigUint], key: &SraKeyPair) -> Vec<BigUint> 
 }
 
 /// Initial card values: each card mapped to its index as a BigUint.
+// shortcut: raw indices leak structure (1 stays 1), replace with reviewed encoding before claiming card secrecy.
 pub fn card_values() -> Vec<BigUint> {
     Deck::new()
         .iter()

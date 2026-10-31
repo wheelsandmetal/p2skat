@@ -35,22 +35,35 @@ impl std::error::Error for UserQuit {}
 
 /// Async function that polls for Ctrl+C. Use in `tokio::select!` alongside
 /// network recv calls so users can quit during opponent turns.
+static INPUT_EVENTS: std::sync::Mutex<std::collections::VecDeque<Event>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
 pub async fn poll_quit() -> UserQuit {
     loop {
-        let is_quit = tokio::task::spawn_blocking(|| {
-            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    return key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL);
+        if event::poll(Duration::ZERO).unwrap_or(false) {
+            if let Ok(event) = event::read() {
+                if matches!(&event, Event::Key(key) if TerminalUi::check_quit(key)) {
+                    return UserQuit;
+                }
+                let mut events = INPUT_EVENTS.lock().unwrap();
+                if events.len() < 128 {
+                    events.push_back(event);
                 }
             }
-            false
-        })
-        .await
-        .unwrap_or(false);
-        if is_quit {
-            return UserQuit;
         }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn next_event() -> Result<Event> {
+    loop {
+        if let Some(event) = INPUT_EVENTS.lock().unwrap().pop_front() {
+            return Ok(event);
+        }
+        if event::poll(Duration::ZERO)? {
+            return Ok(event::read()?);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -109,6 +122,13 @@ impl TerminalUi {
         execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
         Ok(())
+    }
+
+    pub fn print_final_scores(&self) {
+        println!("\nFinal scores:");
+        for (seat, name) in self.names.iter().enumerate() {
+            println!("  {}: {}", name, self.scores[seat]);
+        }
     }
 
     // === State setters ===
@@ -186,11 +206,13 @@ impl TerminalUi {
     pub fn display_tricks(&mut self) -> Result<()> {
         match &self.previous_trick {
             Some(trick) => {
-                self.action_lines = vec![Line::from(format!("=== Trick {} ===", self.trick_num - 1))];
+                self.action_lines =
+                    vec![Line::from(format!("=== Trick {} ===", self.trick_num - 1))];
                 self.action_lines.push(Line::from(""));
                 self.action_lines.extend(self.trick_action_lines(&trick));
                 self.action_lines.push(Line::from(""));
-                self.action_lines.push(Line::from(format!("=== Trick {} ===", self.trick_num)));
+                self.action_lines
+                    .push(Line::from(format!("=== Trick {} ===", self.trick_num)));
             }
             None => {
                 self.action_lines = vec![Line::from(format!("=== Trick {} ===", self.trick_num))];
@@ -198,7 +220,8 @@ impl TerminalUi {
         }
 
         self.action_lines.push(Line::from(""));
-        self.action_lines.extend(self.trick_action_lines(&self.current_trick));
+        self.action_lines
+            .extend(self.trick_action_lines(&self.current_trick));
         self.draw()?;
         Ok(())
     }
@@ -226,7 +249,6 @@ impl TerminalUi {
         lines
     }
 
-
     fn build_info_line(&self) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
 
@@ -249,7 +271,11 @@ impl TerminalUi {
         }
 
         for (i, name) in self.names.iter().enumerate() {
-            let label = if i == self.my_seat { "You" } else { name.as_str() };
+            let label = if i == self.my_seat {
+                "You"
+            } else {
+                name.as_str()
+            };
             spans.push(Span::raw(format!("{}: {} ", label, self.scores[i])));
         }
 
@@ -310,7 +336,7 @@ impl TerminalUi {
         self.draw()
     }
 
-    pub fn get_bid_action(
+    pub async fn get_bid_action(
         &mut self,
         hand: &[Card],
         next_bid: Option<u32>,
@@ -327,16 +353,13 @@ impl TerminalUi {
                 Some(v) => format!("{}", v),
                 None => "??".to_string(),
             };
-            self.help_line = Line::from(format!(
-                " b bid {} │ p pass │ Ctrl+C quit",
-                next_str
-            ));
+            self.help_line = Line::from(format!(" b bid {} │ p pass │ Ctrl+C quit", next_str));
         }
 
         self.draw()?;
 
         loop {
-            if let Event::Key(key) = event::read()? {
+            if let Event::Key(key) = next_event().await? {
                 if Self::check_quit(&key) {
                     return Err(UserQuit.into());
                 }
@@ -369,11 +392,10 @@ impl TerminalUi {
         };
         self.action_lines.push(Line::from(msg));
         self.draw()?;
-        std::thread::sleep(std::time::Duration::from_millis(800));
         Ok(())
     }
 
-    pub fn ask_skat_pickup(&mut self, hand: &[Card]) -> Result<bool> {
+    pub async fn ask_skat_pickup(&mut self, hand: &[Card]) -> Result<bool> {
         self.hand = hand.to_vec();
         self.cursor = None;
         self.legal_cards = None;
@@ -386,7 +408,7 @@ impl TerminalUi {
         self.draw()?;
 
         loop {
-            if let Event::Key(key) = event::read()? {
+            if let Event::Key(key) = next_event().await? {
                 if Self::check_quit(&key) {
                     return Err(UserQuit.into());
                 }
@@ -399,7 +421,7 @@ impl TerminalUi {
         }
     }
 
-    pub fn choose_skat_discard(&mut self, hand: &[Card]) -> Result<Vec<Card>> {
+    pub async fn choose_skat_discard(&mut self, hand: &[Card]) -> Result<Vec<Card>> {
         self.hand = hand.to_vec();
         self.skat_selected = Vec::new();
         self.cursor = Some(0);
@@ -412,7 +434,7 @@ impl TerminalUi {
         self.draw()?;
 
         loop {
-            if let Event::Key(key) = event::read()? {
+            if let Event::Key(key) = next_event().await? {
                 if Self::check_quit(&key) {
                     return Err(UserQuit.into());
                 }
@@ -452,7 +474,7 @@ impl TerminalUi {
         }
     }
 
-    pub fn declare_contract(
+    pub async fn declare_contract(
         &mut self,
         hand: &[Card],
         bid: u32,
@@ -492,15 +514,14 @@ impl TerminalUi {
                 } else {
                     format!("{}{} {} ({})", marker, name, symbol, base)
                 };
-                self.action_lines.push(Line::from(Span::styled(text, style)));
+                self.action_lines
+                    .push(Line::from(Span::styled(text, style)));
             }
 
-            self.help_line = Line::from(
-                " \u{2191} \u{2193} select │ Enter confirm │ Ctrl+C quit",
-            );
+            self.help_line = Line::from(" \u{2191} \u{2193} select │ Enter confirm │ Ctrl+C quit");
             self.draw()?;
 
-            if let Event::Key(key) = event::read()? {
+            if let Event::Key(key) = next_event().await? {
                 if Self::check_quit(&key) {
                     return Err(UserQuit.into());
                 }
@@ -531,13 +552,13 @@ impl TerminalUi {
         }
     }
 
-    pub fn choose_card(
+    pub async fn choose_card(
         &mut self,
         hand: &[Card],
         legal: &[Card],
         trick: &Trick,
         _contract: &Contract,
-        trick_num: u32,
+        _trick_num: u32,
     ) -> Result<Card> {
         self.hand = hand.to_vec();
         self.legal_cards = Some(legal.to_vec());
@@ -555,12 +576,10 @@ impl TerminalUi {
         self.cursor = Some(cursor);
 
         loop {
-            self.help_line = Line::from(
-                " \u{2190} \u{2192} move │ Enter play │ Ctrl+C quit",
-            );
+            self.help_line = Line::from(" \u{2190} \u{2192} move │ Enter play │ Ctrl+C quit");
             self.draw()?;
 
-            if let Event::Key(key) = event::read()? {
+            if let Event::Key(key) = next_event().await? {
                 if Self::check_quit(&key) {
                     return Err(UserQuit.into());
                 }
@@ -592,7 +611,6 @@ impl TerminalUi {
             winner_name, points
         )));
         self.draw()?;
-        std::thread::sleep(std::time::Duration::from_millis(1000));
         Ok(())
     }
 
@@ -627,12 +645,12 @@ impl TerminalUi {
         self.draw()
     }
 
-    pub fn wait_for_continue(&mut self) -> Result<bool> {
+    pub async fn wait_for_continue(&mut self) -> Result<bool> {
         self.help_line = Line::from(" Enter next round │ q quit │ Ctrl+C quit");
         self.draw()?;
 
         loop {
-            if let Event::Key(key) = event::read()? {
+            if let Event::Key(key) = next_event().await? {
                 if Self::check_quit(&key) {
                     return Err(UserQuit.into());
                 }
@@ -671,9 +689,7 @@ fn card_span_selected(card: Card) -> Span<'static> {
     };
     Span::styled(
         text,
-        Style::default()
-            .fg(color)
-            .add_modifier(Modifier::REVERSED),
+        Style::default().fg(color).add_modifier(Modifier::REVERSED),
     )
 }
 
@@ -696,5 +712,83 @@ fn game_type_display(gt: &GameType) -> Span<'static> {
         }
         GameType::Grand => Span::styled("Grand", Style::default().fg(Color::Yellow)),
         GameType::Null => Span::styled("Null", Style::default().fg(Color::Gray)),
+    }
+}
+
+impl crate::session::Frontend for TerminalUi {
+    fn set_hand(&mut self, value: &[Card]) {
+        TerminalUi::set_hand(self, value);
+    }
+    fn set_trick(&mut self, value: &Trick) {
+        TerminalUi::set_trick(self, value);
+    }
+    fn set_contract(&mut self, value: &Contract) {
+        TerminalUi::set_contract(self, value);
+    }
+    fn set_scores(&mut self, value: &[i32; 3]) {
+        TerminalUi::set_scores(self, value);
+    }
+    fn set_trick_num(&mut self, value: u32) {
+        TerminalUi::set_trick_num(self, value);
+    }
+    fn set_round(&mut self, value: u32) {
+        TerminalUi::set_round(self, value);
+    }
+    fn show_status(&mut self, message: &str) -> Result<()> {
+        TerminalUi::show_status(self, message)
+    }
+    fn display_tricks(&mut self) -> Result<()> {
+        TerminalUi::display_tricks(self)
+    }
+    fn show_bid_action(&mut self, name: &str, action: &BidAction) -> Result<()> {
+        TerminalUi::show_bid_action(self, name, action)
+    }
+    fn show_trick_result(&mut self, winner: &str, points: u32) -> Result<()> {
+        TerminalUi::show_trick_result(self, winner, points)
+    }
+    fn show_round_result(
+        &mut self,
+        declarer: &str,
+        value: i32,
+        points: u32,
+        scores: &[i32; 3],
+        names: &[String; 3],
+    ) -> Result<()> {
+        TerminalUi::show_round_result(self, declarer, value, points, scores, names)
+    }
+    async fn get_bid_action(
+        &mut self,
+        hand: &[Card],
+        next_bid: Option<u32>,
+        is_responder: bool,
+    ) -> Result<BidAction> {
+        TerminalUi::get_bid_action(self, hand, next_bid, is_responder).await
+    }
+    async fn ask_skat_pickup(&mut self, hand: &[Card]) -> Result<bool> {
+        TerminalUi::ask_skat_pickup(self, hand).await
+    }
+    async fn choose_skat_discard(&mut self, hand: &[Card]) -> Result<Vec<Card>> {
+        TerminalUi::choose_skat_discard(self, hand).await
+    }
+    async fn declare_contract(
+        &mut self,
+        hand: &[Card],
+        bid: u32,
+        is_hand: bool,
+    ) -> Result<Contract> {
+        TerminalUi::declare_contract(self, hand, bid, is_hand).await
+    }
+    async fn choose_card(
+        &mut self,
+        hand: &[Card],
+        legal: &[Card],
+        trick: &Trick,
+        contract: &Contract,
+        trick_num: u32,
+    ) -> Result<Card> {
+        TerminalUi::choose_card(self, hand, legal, trick, contract, trick_num).await
+    }
+    async fn wait_for_continue(&mut self) -> Result<bool> {
+        TerminalUi::wait_for_continue(self).await
     }
 }

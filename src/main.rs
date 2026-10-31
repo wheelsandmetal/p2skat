@@ -1,8 +1,4 @@
-mod crypto;
-mod game;
-mod net;
-mod sim;
-mod ui;
+use p2skat::{crypto, net, sim};
 
 use clap::{Parser, Subcommand};
 
@@ -40,7 +36,7 @@ enum Command {
         /// Number of rounds to simulate
         #[arg(short = 'n', long, default_value = "10")]
         rounds: u32,
-        /// Use 2048-bit prime (slower but production-grade)
+        /// Use the real 2048-bit prime (slower)
         #[arg(long)]
         large_prime: bool,
         /// Print detailed game log
@@ -82,7 +78,9 @@ async fn main() -> anyhow::Result<()> {
 
             net::session::host_game(port, key, prime, tor_client).await?;
         }
-        Command::Join { addr, peer_addr, .. } => {
+        Command::Join {
+            addr, peer_addr, ..
+        } => {
             let key_task = tokio::task::spawn_blocking(|| {
                 let prime = crypto::sra::shared_prime();
                 let key = crypto::sra::SraKeyPair::generate(&prime);

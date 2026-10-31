@@ -7,16 +7,8 @@ use tokio::net::TcpListener;
 use super::message::{framing, Message};
 use super::peer::PeerConnection;
 use super::tor::ArtiClient;
-use crate::crypto::protocol::{
-    card_values, encrypt_and_shuffle, verify_hand, DealPositions,
-};
 use crate::crypto::sra::SraKeyPair;
-use crate::game::bidding::{BidAction, BiddingState, Seat};
-use crate::game::card::Card;
-use crate::game::contract::{Contract, GameType, Modifiers};
-use crate::game::scoring::{count_points, game_value, ScoreBoard};
-use crate::game::state::{GameState, Phase};
-use crate::game::trick::{legal_plays, Trick};
+use crate::game::bidding::Seat;
 use crate::ui::terminal::TerminalUi;
 
 /// A game session managing two peer connections.
@@ -29,717 +21,65 @@ pub struct Session {
     pub prime: BigUint,
 }
 
-impl Session {
-    /// Send a message to a specific seat (not our own).
-    pub async fn send_to(&self, seat: usize, msg: &Message) -> Result<()> {
-        let peer = self.peer_for_seat(seat)?;
-        peer.send(msg).await
-    }
+pub struct NativeTransport {
+    pub peers: [Arc<PeerConnection>; 2],
+}
 
-    /// Broadcast a message to both peers.
-    pub async fn broadcast(&self, msg: &Message) -> Result<()> {
-        self.peers[0].send(msg).await?;
-        self.peers[1].send(msg).await?;
-        Ok(())
+impl crate::session::Transport for NativeTransport {
+    async fn send_to(&self, seat: usize, message: &Message) -> Result<()> {
+        let peer = self
+            .peers
+            .iter()
+            .find(|peer| peer.seat == seat)
+            .ok_or_else(|| anyhow::anyhow!("No peer for seat {}", seat))?;
+        peer.send(message).await
     }
-
-    /// Receive a message from a specific seat.
-    pub async fn recv_from(&self, seat: usize) -> Result<Message> {
-        let peer = self.peer_for_seat(seat)?;
-        peer.recv().await
-    }
-
-    /// Receive a message from any peer, returns (seat, message).
-    pub async fn recv_any(&self) -> Result<(usize, Message)> {
+    async fn recv_any(&self) -> Result<(usize, Message)> {
         tokio::select! {
             msg = self.peers[0].recv() => Ok((self.peers[0].seat, msg?)),
             msg = self.peers[1].recv() => Ok((self.peers[1].seat, msg?)),
+            quit = crate::ui::terminal::poll_quit() => Err(quit.into()),
         }
     }
+}
 
-    async fn recv_from_or_quit(&self, seat: usize) -> Result<Message> {
-        tokio::select! {
-            result = self.recv_from(seat) => result,
-            _ = crate::ui::terminal::poll_quit() => Err(crate::ui::terminal::UserQuit.into()),
+impl Session {
+    pub async fn run_game(self) -> Result<()> {
+        let mut ui = TerminalUi::new(self.my_seat, &self.names)?;
+        let mut game = crate::session::Session::new(
+            self.my_seat,
+            self.my_name,
+            self.names,
+            self.key,
+            self.prime,
+            NativeTransport { peers: self.peers },
+        )?;
+        let result = game.run_game(&mut ui).await;
+        ui.cleanup()?;
+        if result.is_ok() {
+            ui.print_final_scores();
         }
-    }
-
-    async fn recv_any_or_quit(&self) -> Result<(usize, Message)> {
-        tokio::select! {
-            result = self.recv_any() => result,
-            _ = crate::ui::terminal::poll_quit() => Err(crate::ui::terminal::UserQuit.into()),
-        }
-    }
-
-    fn peer_for_seat(&self, seat: usize) -> Result<&PeerConnection> {
-        for peer in &self.peers {
-            if peer.seat == seat {
-                return Ok(peer);
-            }
-        }
-        anyhow::bail!("No peer for seat {}", seat)
-    }
-
-    /// Run the full game loop.
-    pub async fn run_game(mut self) -> Result<()> {
-        let result = self.run_game_inner().await;
         match result {
-            Err(e) if e.downcast_ref::<crate::ui::terminal::UserQuit>().is_some() => {
-                // Terminal cleanup happens via Drop on TerminalUi.
-                // TCP connections close when Session drops, peers get errors and exit.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::ui::terminal::UserQuit>()
+                    .is_some() =>
+            {
                 println!("\nGame ended by player.");
                 Ok(())
             }
             other => other,
         }
     }
-
-    async fn run_game_inner(&mut self) -> Result<()> {
-        let mut state = GameState::new(Seat::from_index(self.my_seat));
-        let mut ui = TerminalUi::new(self.my_seat, &self.names)?;
-
-        state.phase = Phase::Shuffling;
-        let mut score_board = ScoreBoard::new();
-        state.round = 1;
-        ui.set_round(state.round);
-
-        loop {
-
-            // === Shuffle & Deal Phase ===
-            ui.show_status("Shuffling and dealing cards...")?;
-            let encrypted_deck = self.shuffle_phase().await?;
-            state.encrypted_deck = encrypted_deck.clone();
-
-            state.phase = Phase::Dealing;
-            let my_hand = self.deal_phase(&encrypted_deck).await?;
-            state.hand = my_hand;
-            state.sort_hand();
-            ui.set_hand(&state.hand);
-
-            // === Bidding Phase ===
-            state.phase = Phase::Bidding;
-            state.bidding = BiddingState::new();
-            ui.show_status("=== Bidding ===")?;
-
-            let (winner_seat, final_bid) = self.bidding_phase(&mut state, &mut ui).await?;
-            state.declarer = Some(winner_seat);
-            state.bidding.winner = Some(winner_seat);
-            state.bidding.final_bid = Some(final_bid);
-
-            // === Skat Pickup & Declaration ===
-            state.phase = Phase::PickingUpSkat;
-            let contract = self
-                .declaration_phase(&mut state, &mut ui, winner_seat, final_bid)
-                .await?;
-            state.contract = Some(contract);
-            state.sort_hand();
-            ui.set_contract(&contract);
-            ui.set_hand(&state.hand);
-
-            // === Playing Phase ===
-            state.phase = Phase::Playing;
-            state.trick_leader = Seat::Forehand;
-            state.current_player = Seat::Forehand;
-            state.tricks_played = 0;
-            state.tricks_won = [Vec::new(), Vec::new(), Vec::new()];
-
-            self.playing_phase(&mut state, &mut ui).await?;
-
-            // Reveal only after play ends so every peer can score the same hand and skat.
-            let revealed_deck = self.reveal_phase(&encrypted_deck).await?;
-
-            // === Scoring ===
-            state.phase = Phase::Scoring;
-            let declarer_seat = state.declarer.unwrap();
-            let declarer_idx = declarer_seat.index();
-
-            let (value, decl_points) = score_revealed_hand(&state, &revealed_deck)?;
-
-            score_board.record(declarer_idx, value, final_bid);
-            ui.set_scores(&score_board.scores);
-
-            ui.show_round_result(
-                &self.names[declarer_idx],
-                value,
-                decl_points,
-                &score_board.scores,
-                &self.names,
-            )?;
-
-            // Check if players want to continue
-            if ui.wait_for_continue()? {
-                state.new_round();
-                ui.set_round(state.round);
-                continue;
-            } else {
-                break;
-            }
-        }
-
-        ui.cleanup()?;
-        println!("\nFinal scores:");
-        for (i, name) in self.names.iter().enumerate() {
-            println!("  {}: {}", name, score_board.scores[i]);
-        }
-        Ok(())
-    }
-
-    /// Shuffle phase: each player encrypts and shuffles in sequence.
-    async fn shuffle_phase(&mut self) -> Result<Vec<BigUint>> {
-        // Previous rounds reveal their keys, so every new deck needs a fresh pair.
-        self.key = SraKeyPair::generate(&self.prime);
-        let values = card_values();
-        let initial: Vec<BigUint> = values.into_iter().collect();
-
-        match self.my_seat {
-            0 => {
-                // I'm first: encrypt, shuffle, send to seat 1
-                let shuffled = encrypt_and_shuffle(&initial, &self.key);
-                let msg = deck_to_message(&shuffled);
-                self.send_to(1, &msg).await?;
-
-                // Wait for final deck from seat 2
-                let final_msg = self.recv_from_or_quit(2).await?;
-                Ok(message_to_deck(&final_msg)?)
-            }
-            1 => {
-                // Wait for deck from seat 0
-                let msg = self.recv_from_or_quit(0).await?;
-                let deck = message_to_deck(&msg)?;
-
-                // Encrypt and shuffle, send to seat 2
-                let shuffled = encrypt_and_shuffle(&deck, &self.key);
-                let msg = deck_to_message(&shuffled);
-                self.send_to(2, &msg).await?;
-
-                // Wait for final deck from seat 2
-                let final_msg = self.recv_from_or_quit(2).await?;
-                Ok(message_to_deck(&final_msg)?)
-            }
-            2 => {
-                // Wait for deck from seat 1
-                let msg = self.recv_from_or_quit(1).await?;
-                let deck = message_to_deck(&msg)?;
-
-                // Encrypt and shuffle
-                let shuffled = encrypt_and_shuffle(&deck, &self.key);
-
-                // Broadcast final deck to both peers
-                let msg = deck_to_message(&shuffled);
-                self.broadcast(&msg).await?;
-
-                Ok(shuffled)
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    /// Deal phase: decrypt cards for each player via sequential decryption.
-    async fn deal_phase(&self, encrypted_deck: &[BigUint]) -> Result<Vec<Card>> {
-        let my_seat = self.my_seat;
-
-        // For each player's hand, the other two players need to remove their encryption layers.
-        // Then the owner removes theirs to get plaintext.
-
-        let mut my_cards = Vec::new();
-
-        for target_player in 0..3 {
-            let indices = DealPositions::player_indices(target_player);
-            let target_encrypted: Vec<BigUint> =
-                indices.iter().map(|&i| encrypted_deck[i].clone()).collect();
-
-            if target_player == my_seat {
-                // I need others to decrypt for me.
-                // The two non-me players decrypt sequentially.
-                let others: Vec<usize> = (0..3).filter(|&s| s != my_seat).collect();
-
-                // Send my encrypted cards to first other player for partial decrypt.
-                let msg = Message::PartialDecrypt {
-                    target: my_seat,
-                    cards: biguints_to_hex(&target_encrypted),
-                    indices: indices.clone(),
-                };
-                self.send_to(others[0], &msg).await?;
-
-                // Receive partially decrypted from first other.
-                let resp = self.recv_from_or_quit(others[0]).await?;
-                let partial1 = extract_partial_decrypt(&resp)?;
-
-                // Send to second other for their layer.
-                let msg = Message::PartialDecrypt {
-                    target: my_seat,
-                    cards: biguints_to_hex(&partial1),
-                    indices: indices.clone(),
-                };
-                self.send_to(others[1], &msg).await?;
-
-                // Receive from second other.
-                let resp = self.recv_from_or_quit(others[1]).await?;
-                let partial2 = extract_partial_decrypt(&resp)?;
-
-                // Remove my own layer.
-                let plaintext: Vec<BigUint> =
-                    partial2.iter().map(|c| self.key.decrypt(c)).collect();
-
-                // Convert to cards.
-                for val in &plaintext {
-                    let idx: u64 = val
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Invalid card value: {}", val))?;
-                    let card = Card::from_index(idx)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid card index: {}", idx))?;
-                    my_cards.push(card);
-                }
-            } else {
-                // Another player needs decryption. Wait for request, decrypt, forward.
-                let msg = self.recv_from_or_quit(target_player).await?;
-
-                if let Message::PartialDecrypt { target, cards, .. } = msg {
-                    anyhow::ensure!(target == target_player, "Unexpected decryption target");
-                    let encrypted = hex_to_biguints(&cards)?;
-                    let decrypted: Vec<BigUint> =
-                        encrypted.iter().map(|c| self.key.decrypt(c)).collect();
-
-                    // If target is asking us, send back.
-                    let resp = Message::PartialDecrypt {
-                        target: target_player,
-                        cards: biguints_to_hex(&decrypted),
-                        indices: indices.clone(),
-                    };
-                    self.send_to(target_player, &resp).await?;
-                } else {
-                    anyhow::bail!("Expected PartialDecrypt from seat {}", target_player);
-                }
-            }
-        }
-
-        Ok(my_cards)
-    }
-
-    /// Bidding phase using the terminal UI.
-    async fn bidding_phase(
-        &self,
-        state: &mut GameState,
-        ui: &mut TerminalUi,
-    ) -> Result<(Seat, u32)> {
-        loop {
-            if state.bidding.is_done() {
-                break;
-            }
-
-            if state.bidding.turn == state.my_seat {
-                let action = ui.get_bid_action(
-                    &state.hand,
-                    state.bidding.next_bid_value(),
-                    state.my_seat == state.bidding.responder,
-                )?;
-
-                state.bidding.process(state.my_seat, action).map_err(|e| anyhow::anyhow!(e))?;
-
-                // Broadcast my action
-                let msg = Message::BidMsg {
-                    seat: state.my_seat.index(),
-                    action: action.into(),
-                };
-                self.broadcast(&msg).await?;
-                ui.show_bid_action(&self.my_name, &action)?;
-            } else {
-                // Wait for the other player's bid
-                let (_seat, msg) = self.recv_any_or_quit().await?;
-                if let Message::BidMsg { seat: s, action } = msg {
-                    let bid_action: BidAction = action.into();
-                    state
-                        .bidding
-                        .process(Seat::from_index(s), bid_action).map_err(|e| anyhow::anyhow!(e))?;
-                    ui.show_bid_action(&self.names[s], &bid_action)?;
-                }
-            }
-        }
-
-        let winner = state.bidding.winner.unwrap();
-        let bid = state.bidding.final_bid.unwrap();
-        ui.show_status(&format!(
-            "{} wins the bidding at {}",
-            self.names[winner.index()],
-            bid
-        ))?;
-
-        Ok((winner, bid))
-    }
-
-    /// Declaration phase: skat pickup and contract declaration.
-    async fn declaration_phase(
-        &self,
-        state: &mut GameState,
-        ui: &mut TerminalUi,
-        declarer: Seat,
-        bid: u32,
-    ) -> Result<Contract> {
-        if declarer == state.my_seat {
-            // I'm declarer. Ask if I want to pick up the Skat.
-            let pick_up = ui.ask_skat_pickup(&state.hand)?;
-
-            if pick_up {
-                // Request skat decryption from others.
-                self.broadcast(&Message::SkatRequest).await?;
-
-                // Decrypt skat cards (same process as dealing).
-                let skat_indices = DealPositions::skat_indices();
-                let skat_encrypted: Vec<BigUint> = skat_indices
-                    .iter()
-                    .map(|&i| state.encrypted_deck[i].clone())
-                    .collect();
-
-                let others: Vec<usize> = (0..3).filter(|&s| s != self.my_seat).collect();
-
-                // Ask first other to decrypt
-                let msg = Message::PartialDecrypt {
-                    target: self.my_seat,
-                    cards: biguints_to_hex(&skat_encrypted),
-                    indices: skat_indices.clone(),
-                };
-                self.send_to(others[0], &msg).await?;
-                let resp = self.recv_from_or_quit(others[0]).await?;
-                let partial1 = extract_partial_decrypt(&resp)?;
-
-                // Ask second other to decrypt
-                let msg = Message::PartialDecrypt {
-                    target: self.my_seat,
-                    cards: biguints_to_hex(&partial1),
-                    indices: skat_indices.clone(),
-                };
-                self.send_to(others[1], &msg).await?;
-                let resp = self.recv_from_or_quit(others[1]).await?;
-                let partial2 = extract_partial_decrypt(&resp)?;
-
-                // Remove my layer
-                let skat_plain: Vec<BigUint> =
-                    partial2.iter().map(|c| self.key.decrypt(c)).collect();
-
-                let mut skat_cards = Vec::new();
-                for val in &skat_plain {
-                    let idx: u64 = val.try_into()?;
-                    skat_cards.push(Card::from_index(idx).unwrap());
-                }
-
-                // Add skat to hand
-                state.hand.extend(&skat_cards);
-                state.skat = skat_cards;
-                state.sort_hand();
-
-                // Let player choose 2 cards to put away
-                let put_away = ui.choose_skat_discard(&state.hand)?;
-                state.skat_put_away = put_away.clone();
-                for card in &put_away {
-                    state.hand.retain(|c| c != card);
-                }
-
-                // Declare contract
-                let contract = ui.declare_contract(&state.hand, bid, false)?;
-
-                let msg = Message::Declaration {
-                    game_type: game_type_to_msg(contract.game_type),
-                    hand: false,
-                    schneider_announced: contract.modifiers.schneider_announced,
-                    schwarz_announced: contract.modifiers.schwarz_announced,
-                    ouvert: contract.modifiers.ouvert,
-                    revealed_hand: None,
-                };
-                self.broadcast(&msg).await?;
-
-                Ok(contract)
-            } else {
-                // Hand game
-                let contract = ui.declare_contract(&state.hand, bid, true)?;
-
-                let msg = Message::Declaration {
-                    game_type: game_type_to_msg(contract.game_type),
-                    hand: true,
-                    schneider_announced: contract.modifiers.schneider_announced,
-                    schwarz_announced: contract.modifiers.schwarz_announced,
-                    ouvert: contract.modifiers.ouvert,
-                    revealed_hand: if contract.modifiers.ouvert {
-                        Some(state.hand.iter().map(|c| (*c).into()).collect())
-                    } else {
-                        None
-                    },
-                };
-                self.broadcast(&msg).await?;
-
-                Ok(contract)
-            }
-        } else {
-            // Wait for declarer's actions.
-            // Might get SkatRequest or Declaration.
-            loop {
-                let (_seat, msg) = self.recv_any_or_quit().await?;
-                match msg {
-                    Message::SkatRequest => {
-                        // We might need to help decrypt the skat. Wait for decrypt request.
-                        let (_, decrypt_msg) = self.recv_any_or_quit().await?;
-                        if let Message::PartialDecrypt { target, cards, indices } = decrypt_msg {
-                            let encrypted = hex_to_biguints(&cards)?;
-                            let decrypted: Vec<BigUint> =
-                                encrypted.iter().map(|c| self.key.decrypt(c)).collect();
-                            let resp = Message::PartialDecrypt {
-                                target,
-                                cards: biguints_to_hex(&decrypted),
-                                indices,
-                            };
-                            self.send_to(target, &resp).await?;
-                        }
-                    }
-                    Message::Declaration {
-                        game_type,
-                        hand,
-                        schneider_announced,
-                        schwarz_announced,
-                        ouvert,
-                        ..
-                    } => {
-                        let gt = msg_to_game_type(game_type);
-                        let contract = Contract::new(
-                            gt,
-                            Modifiers {
-                                hand,
-                                schneider_announced,
-                                schwarz_announced,
-                                ouvert,
-                            },
-                        );
-                        ui.show_status(&format!(
-                            "{} declares {:?}{}",
-                            self.names[declarer.index()],
-                            gt,
-                            if hand { " Hand" } else { "" }
-                        ))?;
-                        return Ok(contract);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    /// Playing phase: 10 tricks.
-    async fn playing_phase(
-        &self,
-        state: &mut GameState,
-        ui: &mut TerminalUi,
-    ) -> Result<()> {
-        let contract = state.contract.unwrap();
-
-        for trick_num in 0..10 {
-            state.current_trick = Trick::new();
-            let leader = state.trick_leader;
-            ui.set_trick_num(trick_num + 1);
-            ui.set_trick(&state.current_trick);
-            ui.display_tricks()?;
-
-            for play_offset in 0..3 {
-                let current = Seat::from_index((leader.index() + play_offset) % 3);
-                state.current_player = current;
-
-                if current == state.my_seat {
-                    // My turn to play
-                    let legal = legal_plays(&state.hand, &state.current_trick, &contract);
-                    let card = ui.choose_card(&state.hand, &legal, &state.current_trick, &contract, trick_num + 1)?;
-
-                    state.current_trick.play(current.index(), card, &contract);
-                    state.hand.retain(|c| *c != card);
-                    ui.set_trick(&state.current_trick);
-                    ui.set_hand(&state.hand);
-                    ui.display_tricks()?;
-
-                    let msg = Message::PlayCard { card: card.into() };
-                    self.broadcast(&msg).await?;
-                } else {
-                    // Wait for their card
-                    let msg = self.recv_from_or_quit(current.index()).await?;
-                    if let Message::PlayCard { card } = msg {
-                        let played = card.to_card();
-                        state.current_trick.play(current.index(), played, &contract);
-                        ui.set_trick(&state.current_trick);
-                        ui.display_tricks()?;
-                    }
-                }
-            }
-
-            // Determine trick winner
-            let winner = state.current_trick.winner(&contract);
-            let trick_points = state.current_trick.points();
-            let won_cards: Vec<Card> =
-                state.current_trick.cards.iter().map(|(_, c)| *c).collect();
-            state.tricks_won[winner].extend(won_cards);
-            state.tricks_played += 1;
-            state.trick_leader = Seat::from_index(winner);
-
-            ui.show_trick_result(&self.names[winner], trick_points)?;
-        }
-
-        Ok(())
-    }
-
-    /// Key reveal and verification phase.
-    async fn reveal_phase(&self, encrypted_deck: &[BigUint]) -> Result<Vec<Card>> {
-        // Broadcast my keys
-        let msg = Message::RevealKeys {
-            e: self.key.e.to_str_radix(16),
-            d: self.key.d.to_str_radix(16),
-        };
-        self.broadcast(&msg).await?;
-
-        // Collect other keys
-        let mut keys_e = vec![BigUint::default(); 3];
-        let mut keys_d = vec![BigUint::default(); 3];
-        keys_e[self.my_seat] = self.key.e.clone();
-        keys_d[self.my_seat] = self.key.d.clone();
-
-        for peer in &self.peers {
-            let seat = peer.seat;
-            match self.recv_from_or_quit(seat).await? {
-                Message::RevealKeys { e, d } => {
-                    keys_e[seat] = BigUint::parse_bytes(e.as_bytes(), 16)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid key hex"))?;
-                    keys_d[seat] = BigUint::parse_bytes(d.as_bytes(), 16)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid key hex"))?;
-                }
-                other => anyhow::bail!("Expected RevealKeys from seat {}, got {:?}", seat, other),
-            }
-        }
-
-        // Verify: reconstruct all keys and check the deck
-        let key_pairs: Vec<SraKeyPair> = (0..3)
-            .map(|i| SraKeyPair {
-                e: keys_e[i].clone(),
-                d: keys_d[i].clone(),
-                p: self.prime.clone(),
-            })
-            .collect();
-
-        let cards = verify_hand(
-            encrypted_deck,
-            [&key_pairs[0], &key_pairs[1], &key_pairs[2]],
-        )
-        .map_err(|e| anyhow::anyhow!("Verification failed: {}", e))?;
-        eprintln!("Verification passed: all cards accounted for.");
-        Ok(cards)
-    }
-}
-
-// === Helper functions ===
-
-fn score_revealed_hand(state: &GameState, deck: &[Card]) -> Result<(i32, u32)> {
-    anyhow::ensure!(deck.len() == 32, "Expected 32 revealed cards");
-    let declarer = state
-        .declarer
-        .ok_or_else(|| anyhow::anyhow!("Missing declarer"))?
-        .index();
-    let contract = state
-        .contract
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Missing contract"))?;
-    let mut declarer_cards = deck[DealPositions::player_range(declarer)].to_vec();
-    declarer_cards.extend_from_slice(&deck[DealPositions::skat_range()]);
-
-    // The two unplayed cards are the final skat, including in Hand games.
-    let mut skat = deck.to_vec();
-    for won_cards in &state.tricks_won {
-        anyhow::ensure!(won_cards.len() % 3 == 0, "Incomplete trick in scoring");
-        for card in won_cards {
-            let pos = skat
-                .iter()
-                .position(|c| c == card)
-                .ok_or_else(|| anyhow::anyhow!("Played card missing or duplicated: {}", card))?;
-            skat.remove(pos);
-        }
-    }
-    anyhow::ensure!(skat.len() == 2, "Expected 30 played cards");
-    anyhow::ensure!(
-        skat.iter().all(|c| declarer_cards.contains(c)),
-        "Skat contains another player's card"
-    );
-    if contract.modifiers.hand {
-        anyhow::ensure!(
-            skat.iter()
-                .all(|c| deck[DealPositions::skat_range()].contains(c)),
-            "Skat was played in a Hand game"
-        );
-    }
-
-    let won_cards = &state.tricks_won[declarer];
-    let points = count_points(won_cards) + count_points(&skat);
-    let value = game_value(
-        contract,
-        &declarer_cards,
-        points,
-        (won_cards.len() / 3) as u32,
-        10,
-    );
-    Ok((value, points))
-}
-
-fn deck_to_message(deck: &[BigUint]) -> Message {
-    Message::ShuffledDeck {
-        cards: biguints_to_hex(deck),
-    }
-}
-
-fn message_to_deck(msg: &Message) -> Result<Vec<BigUint>> {
-    match msg {
-        Message::ShuffledDeck { cards } => hex_to_biguints(cards),
-        other => anyhow::bail!("Expected ShuffledDeck, got {:?}", other),
-    }
-}
-
-fn biguints_to_hex(values: &[BigUint]) -> Vec<String> {
-    values.iter().map(|v| v.to_str_radix(16)).collect()
-}
-
-fn hex_to_biguints(hex: &[String]) -> Result<Vec<BigUint>> {
-    hex.iter()
-        .map(|s| {
-            BigUint::parse_bytes(s.as_bytes(), 16)
-                .ok_or_else(|| anyhow::anyhow!("Invalid hex: {}", s))
-        })
-        .collect()
-}
-
-fn extract_partial_decrypt(msg: &Message) -> Result<Vec<BigUint>> {
-    match msg {
-        Message::PartialDecrypt { cards, .. } => hex_to_biguints(cards),
-        other => anyhow::bail!("Expected PartialDecrypt, got {:?}", other),
-    }
-}
-
-fn game_type_to_msg(gt: GameType) -> super::message::GameTypeMsg {
-    match gt {
-        GameType::Suit(s) => super::message::GameTypeMsg::Suit(s as u8),
-        GameType::Grand => super::message::GameTypeMsg::Grand,
-        GameType::Null => super::message::GameTypeMsg::Null,
-    }
-}
-
-fn msg_to_game_type(msg: super::message::GameTypeMsg) -> GameType {
-    use crate::game::card::Suit;
-    match msg {
-        super::message::GameTypeMsg::Suit(s) => {
-            let suit = match s {
-                0 => Suit::Diamonds,
-                1 => Suit::Hearts,
-                2 => Suit::Spades,
-                3 => Suit::Clubs,
-                _ => panic!("Invalid suit index"),
-            };
-            GameType::Suit(suit)
-        }
-        super::message::GameTypeMsg::Grand => GameType::Grand,
-        super::message::GameTypeMsg::Null => GameType::Null,
-    }
 }
 
 /// Host a game: listen for 2 connections, coordinate the peer mesh, then start.
-pub async fn host_game(port: u16, key: SraKeyPair, prime: BigUint, tor: Option<ArtiClient>) -> Result<()> {
+pub async fn host_game(
+    port: u16,
+    key: SraKeyPair,
+    prime: BigUint,
+    tor: Option<ArtiClient>,
+) -> Result<()> {
     let my_name = get_player_name();
 
     enum Acceptor {
@@ -751,7 +91,8 @@ pub async fn host_game(port: u16, key: SraKeyPair, prime: BigUint, tor: Option<A
     let mut _onion_svc = None;
 
     let (mut acceptor, addr1_ip) = if let Some(ref client) = tor {
-        let (svc, onion_addr, incoming) = super::tor::create_onion_service(client, "skat-host").await?;
+        let (svc, onion_addr, incoming) =
+            super::tor::create_onion_service(client, "skat-host").await?;
         _onion_svc = Some(svc);
         println!("Hosting game on Tor: {}:443", onion_addr);
         println!("Share this address with players. Waiting for 2 players...");
@@ -763,7 +104,13 @@ pub async fn host_game(port: u16, key: SraKeyPair, prime: BigUint, tor: Option<A
     };
 
     // Helper closure-like accept
-    async fn accept_one(acceptor: &mut Acceptor) -> Result<(super::connect::BoxReader, super::connect::BoxWriter, Option<std::net::IpAddr>)> {
+    async fn accept_one(
+        acceptor: &mut Acceptor,
+    ) -> Result<(
+        super::connect::BoxReader,
+        super::connect::BoxWriter,
+        Option<std::net::IpAddr>,
+    )> {
         match acceptor {
             Acceptor::Tor(ref mut incoming) => {
                 let (r, w) = super::tor::accept_stream(incoming).await?;
@@ -793,25 +140,57 @@ pub async fn host_game(port: u16, key: SraKeyPair, prime: BigUint, tor: Option<A
 
     let names = [my_name.clone(), name1.clone(), name2.clone()];
 
-    framing::send(&mut w1, &Message::GameStart { seats: names.to_vec(), your_seat: 1 }).await?;
-    framing::send(&mut w2, &Message::GameStart { seats: names.to_vec(), your_seat: 2 }).await?;
+    framing::send(
+        &mut w1,
+        &Message::GameStart {
+            seats: names.to_vec(),
+            your_seat: 1,
+        },
+    )
+    .await?;
+    framing::send(
+        &mut w2,
+        &Message::GameStart {
+            seats: names.to_vec(),
+            your_seat: 2,
+        },
+    )
+    .await?;
 
     // Seat 1 reports its listen port (and optionally a full address override for Tor).
     let peer_addr = match framing::recv(&mut r1).await? {
-        Message::PeerListen { port, addr_override } => {
-            addr_override.unwrap_or_else(|| format!("{}:{}", addr1_ip.unwrap(), port))
-        }
+        Message::PeerListen {
+            port,
+            addr_override,
+        } => match addr_override {
+            Some(address) => address,
+            None => format!(
+                "{}:{}",
+                addr1_ip.ok_or_else(|| anyhow::anyhow!("Missing peer address"))?,
+                port
+            ),
+        },
         other => anyhow::bail!("Expected PeerListen from seat 1, got {:?}", other),
     };
     framing::send(&mut w2, &Message::PeerConnect { addr: peer_addr }).await?;
 
     println!("All players connected! Starting game...");
-    println!("  Forehand: {}, Middlehand: {}, Rearhand: {}", names[0], names[1], names[2]);
+    println!(
+        "  Forehand: {}, Middlehand: {}, Rearhand: {}",
+        names[0], names[1], names[2]
+    );
 
     let peer1 = Arc::new(PeerConnection::new(r1, w1, 1));
     let peer2 = Arc::new(PeerConnection::new(r2, w2, 2));
 
-    let session = Session { my_seat: 0, my_name, peers: [peer1, peer2], names, key, prime };
+    let session = Session {
+        my_seat: 0,
+        my_name,
+        peers: [peer1, peer2],
+        names,
+        key,
+        prime,
+    };
     session.run_game().await
 }
 
@@ -837,12 +216,19 @@ pub async fn join_game(
     let msg = framing::recv(&mut reader).await?;
     let (names, my_seat) = match msg {
         Message::GameStart { seats, your_seat } => {
+            anyhow::ensure!(
+                seats.len() == 3 && (your_seat == 1 || your_seat == 2),
+                "Invalid seat assignment"
+            );
             println!("Assigned seat: {}", Seat::from_index(your_seat).name());
             (seats, your_seat)
         }
         _ => anyhow::bail!("Expected GameStart"),
     };
-    println!("  Forehand: {}, Middlehand: {}, Rearhand: {}", names[0], names[1], names[2]);
+    println!(
+        "  Forehand: {}, Middlehand: {}, Rearhand: {}",
+        names[0], names[1], names[2]
+    );
 
     let other_seat: usize;
     let other_peer: Arc<PeerConnection>;
@@ -860,7 +246,14 @@ pub async fn join_game(
             _onion_svc = Some(svc);
             let my_onion = format!("{}:443", onion_addr);
 
-            framing::send(&mut writer, &Message::PeerListen { port: 7878, addr_override: Some(my_onion) }).await?;
+            framing::send(
+                &mut writer,
+                &Message::PeerListen {
+                    port: 7878,
+                    addr_override: Some(my_onion),
+                },
+            )
+            .await?;
             println!("Waiting for peer via Tor...");
 
             let (mut pr, mut pw) = super::tor::accept_stream(&mut incoming).await?;
@@ -870,7 +263,14 @@ pub async fn join_game(
             let peer_listener = TcpListener::bind("0.0.0.0:0").await?;
             let port = peer_listener.local_addr()?.port();
 
-            framing::send(&mut writer, &Message::PeerListen { port, addr_override: peer_addr }).await?;
+            framing::send(
+                &mut writer,
+                &Message::PeerListen {
+                    port,
+                    addr_override: peer_addr,
+                },
+            )
+            .await?;
             println!("Waiting for peer on port {}...", port);
 
             let (peer_stream, _) = peer_listener.accept().await?;
@@ -914,164 +314,4 @@ fn get_player_name() -> String {
     let mut name = String::new();
     std::io::stdin().read_line(&mut name).unwrap();
     name.trim().to_string()
-}
-
-#[cfg(test)]
-mod round_key_tests {
-    use super::*;
-
-    fn connected_peers(a: usize, b: usize) -> (Arc<PeerConnection>, Arc<PeerConnection>) {
-        let (stream_a, stream_b) = tokio::io::duplex(65536);
-        let (reader_a, writer_a) = tokio::io::split(stream_a);
-        let (reader_b, writer_b) = tokio::io::split(stream_b);
-        (
-            Arc::new(PeerConnection::new(Box::new(reader_a), Box::new(writer_a), b)),
-            Arc::new(PeerConnection::new(Box::new(reader_b), Box::new(writer_b), a)),
-        )
-    }
-
-    async fn deal_and_reveal(session: &mut Session) -> Result<(Vec<BigUint>, Vec<Card>)> {
-        let deck = session.shuffle_phase().await?;
-        let hand = session.deal_phase(&deck).await?;
-        session.reveal_phase(&deck).await?;
-        Ok((deck, hand))
-    }
-
-    #[tokio::test]
-    async fn revealed_keys_cannot_decrypt_the_next_round() {
-        let prime = (BigUint::from(1u8) << 127usize) - BigUint::from(1u8);
-        let (peer01, peer10) = connected_peers(0, 1);
-        let (peer02, peer20) = connected_peers(0, 2);
-        let (peer12, peer21) = connected_peers(1, 2);
-        let make_session = |my_seat, peers| Session {
-            my_seat,
-            my_name: format!("Player {my_seat}"),
-            peers,
-            names: std::array::from_fn(|seat| format!("Player {seat}")),
-            key: SraKeyPair::generate(&prime),
-            prime: prime.clone(),
-        };
-        let mut a = make_session(0, [peer01, peer02]);
-        let mut b = make_session(1, [peer10, peer12]);
-        let mut c = make_session(2, [peer20, peer21]);
-        let mut previous_keys: Option<[SraKeyPair; 3]> = None;
-
-        for _ in 0..2 {
-            let (round_a, round_b, round_c) = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                async {
-                    tokio::try_join!(
-                        deal_and_reveal(&mut a),
-                        deal_and_reveal(&mut b),
-                        deal_and_reveal(&mut c),
-                    )
-                },
-            )
-            .await
-            .expect("round should complete")
-            .unwrap();
-
-            assert_eq!(round_a.0, round_b.0);
-            assert_eq!(round_a.0, round_c.0);
-            let decoded = verify_hand(&round_a.0, [&a.key, &b.key, &c.key]).unwrap();
-            for (seat, hand) in [round_a.1, round_b.1, round_c.1].iter().enumerate() {
-                assert_eq!(hand, &decoded[DealPositions::player_range(seat)]);
-            }
-            if let Some(keys) = &previous_keys {
-                assert!(verify_hand(&round_a.0, [&keys[0], &keys[1], &keys[2]]).is_err());
-            }
-            previous_keys = Some([a.key.clone(), b.key.clone(), c.key.clone()]);
-        }
-    }
-}
-
-#[cfg(test)]
-mod scoring_tests {
-    use super::*;
-
-    fn card(index: u64) -> Card {
-        Card::from_index(index).unwrap()
-    }
-
-    fn revealed_round(hand_game: bool, my_seat: usize) -> (GameState, Vec<Card>) {
-        let initial_hand: Vec<_> = [29, 21, 1, 2, 3, 9, 10, 11, 17, 18].map(card).into();
-        let initial_skat = [card(4), card(12)];
-        let mut deck = initial_hand.clone();
-        deck.extend(
-            (1..=32)
-                .map(card)
-                .filter(|c| !initial_hand.contains(c) && !initial_skat.contains(c)),
-        );
-        deck.extend(initial_skat);
-
-        let (skat, won) = if hand_game {
-            (initial_skat, [32, 24, 16, 8, 1, 2].map(card).to_vec())
-        } else {
-            (
-                [card(29), card(21)],
-                [32, 24, 16, 8, 4, 12].map(card).to_vec(),
-            )
-        };
-        let other_tricks: Vec<_> = deck
-            .iter()
-            .copied()
-            .filter(|c| !skat.contains(c) && !won.contains(c))
-            .collect();
-        let mut state = GameState::new(Seat::from_index(my_seat));
-        state.declarer = Some(Seat::Forehand);
-        state.contract = Some(Contract::new(
-            GameType::Grand,
-            Modifiers {
-                hand: hand_game,
-                ..Modifiers::default()
-            },
-        ));
-        state.tricks_won = [
-            won,
-            other_tricks[..12].to_vec(),
-            other_tricks[12..].to_vec(),
-        ];
-        // Only the declarer knows its discards before key reveal.
-        if my_seat == 0 && !hand_game {
-            state.skat = initial_skat.to_vec();
-            state.skat_put_away = skat.to_vec();
-        }
-        (state, deck)
-    }
-
-    #[test]
-    fn peers_score_pickup_from_original_hand_and_reconstructed_discards() {
-        for my_seat in 0..3 {
-            let (state, deck) = revealed_round(false, my_seat);
-            // CJ and SJ were discarded: still with two, despite winning neither jack.
-            assert_eq!(score_revealed_hand(&state, &deck).unwrap(), (72, 68));
-        }
-    }
-
-    #[test]
-    fn peers_include_untouched_skat_in_hand_game_points() {
-        for my_seat in 0..3 {
-            let (state, deck) = revealed_round(true, my_seat);
-            // Twenty unseen skat points lift the declarer from 44 to 64.
-            assert_eq!(score_revealed_hand(&state, &deck).unwrap(), (96, 64));
-        }
-    }
-
-    #[test]
-    fn scoring_rejects_duplicate_or_missing_played_cards() {
-        let (mut state, deck) = revealed_round(false, 1);
-        state.tricks_won[1][0] = state.tricks_won[0][0];
-        assert!(score_revealed_hand(&state, &deck).is_err());
-
-        let (mut state, deck) = revealed_round(false, 1);
-        state.tricks_won[1].truncate(9);
-        assert!(score_revealed_hand(&state, &deck).is_err());
-    }
-
-    #[test]
-    fn scoring_rejects_playing_the_skat_in_a_hand_game() {
-        let (mut state, deck) = revealed_round(true, 1);
-        state.tricks_won[0][4] = deck[30];
-        assert!(score_revealed_hand(&state, &deck).is_err());
-    }
 }

@@ -17,7 +17,10 @@ pub enum Message {
 
     /// Seat 1 tells host its listen port, and optionally a full address override
     /// (required for Tor, where the host can't derive the reachable address).
-    PeerListen { port: u16, addr_override: Option<String> },
+    PeerListen {
+        port: u16,
+        addr_override: Option<String>,
+    },
 
     /// Host tells seat 2 the full address to connect to for seat 1.
     PeerConnect { addr: String },
@@ -39,10 +42,7 @@ pub enum Message {
     },
 
     /// A bid action during the bidding phase.
-    BidMsg {
-        seat: usize,
-        action: BidActionMsg,
-    },
+    BidMsg { seat: usize, action: BidActionMsg },
 
     /// Declarer picks up the Skat (requests decryption of Skat cards).
     SkatRequest,
@@ -131,14 +131,14 @@ impl From<Card> for CardMsg {
 }
 
 impl CardMsg {
-    pub fn to_card(&self) -> Card {
+    pub fn to_card(&self) -> anyhow::Result<Card> {
         use crate::game::card::{Rank, Suit};
         let suit = match self.suit {
             0 => Suit::Diamonds,
             1 => Suit::Hearts,
             2 => Suit::Spades,
             3 => Suit::Clubs,
-            _ => panic!("Invalid suit index"),
+            _ => anyhow::bail!("Invalid suit index: {}", self.suit),
         };
         let rank = match self.rank {
             0 => Rank::Seven,
@@ -149,9 +149,9 @@ impl CardMsg {
             5 => Rank::Ten,
             6 => Rank::Ace,
             7 => Rank::Jack,
-            _ => panic!("Invalid rank index"),
+            _ => anyhow::bail!("Invalid rank index: {}", self.rank),
         };
-        Card::new(suit, rank)
+        Ok(Card::new(suit, rank))
     }
 }
 
@@ -165,13 +165,21 @@ pub enum GameTypeMsg {
 
 /// Framing: length-prefixed JSON messages over TCP.
 /// Format: [4 bytes big-endian length][JSON payload]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod framing {
     use super::Message;
     use anyhow::Result;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
     pub async fn send<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &Message) -> Result<()> {
         let json = serde_json::to_vec(msg)?;
+        anyhow::ensure!(
+            json.len() <= MAX_MESSAGE_BYTES,
+            "Message too large: {} bytes",
+            json.len()
+        );
         let len = (json.len() as u32).to_be_bytes();
         writer.write_all(&len).await?;
         writer.write_all(&json).await?;
@@ -191,13 +199,16 @@ pub mod framing {
 
     impl<R: AsyncReadExt + Unpin> Reader<R> {
         pub fn new(stream: R) -> Self {
-            Self { stream, buffer: Vec::new() }
+            Self {
+                stream,
+                buffer: Vec::new(),
+            }
         }
 
         pub async fn recv(&mut self) -> Result<Message> {
             self.read_to(4).await?;
             let len = u32::from_be_bytes(self.buffer[..4].try_into().unwrap()) as usize;
-            if len > 10 * 1024 * 1024 {
+            if len > MAX_MESSAGE_BYTES {
                 anyhow::bail!("Message too large: {} bytes", len);
             }
             self.read_to(4 + len).await?;
@@ -210,7 +221,12 @@ pub mod framing {
             while self.buffer.len() < len {
                 let remaining = (len - self.buffer.len()) as u64;
                 // read_buf commits consumed bytes before yielding, unlike read_exact.
-                if (&mut self.stream).take(remaining).read_buf(&mut self.buffer).await? == 0 {
+                if (&mut self.stream)
+                    .take(remaining)
+                    .read_buf(&mut self.buffer)
+                    .await?
+                    == 0
+                {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
                 }
             }

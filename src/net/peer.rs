@@ -42,7 +42,13 @@ pub async fn host_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer: &mut W,
     my_name: &str,
 ) -> Result<String> {
-    framing::send(writer, &Message::Hello { name: my_name.to_string() }).await?;
+    framing::send(
+        writer,
+        &Message::Hello {
+            name: my_name.to_string(),
+        },
+    )
+    .await?;
     match framing::recv(reader).await? {
         Message::Hello { name } => Ok(name),
         other => anyhow::bail!("Expected Hello, got {:?}", other),
@@ -59,7 +65,13 @@ pub async fn join_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         Message::Hello { name } => name,
         other => anyhow::bail!("Expected Hello, got {:?}", other),
     };
-    framing::send(writer, &Message::Hello { name: my_name.to_string() }).await?;
+    framing::send(
+        writer,
+        &Message::Hello {
+            name: my_name.to_string(),
+        },
+    )
+    .await?;
     Ok(peer_name)
 }
 
@@ -71,7 +83,9 @@ mod tests {
 
     #[tokio::test]
     async fn canceled_receive_preserves_partial_frames() -> Result<()> {
-        let payload = serde_json::to_vec(&Message::Hello { name: "peer".into() })?;
+        let payload = serde_json::to_vec(&Message::Hello {
+            name: "peer".into(),
+        })?;
         let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(&payload);
 
@@ -102,9 +116,27 @@ mod tests {
         let (mut remote, local) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(local);
         let peer = PeerConnection::new(Box::new(reader), Box::new(writer), 1);
-        remote.write_all(&(10 * 1024 * 1024 + 1_u32).to_be_bytes()).await?;
-        let err = timeout(Duration::from_secs(1), peer.recv()).await?.unwrap_err();
+        remote
+            .write_all(&((framing::MAX_MESSAGE_BYTES + 1) as u32).to_be_bytes())
+            .await?;
+        let err = timeout(Duration::from_secs(1), peer.recv())
+            .await?
+            .unwrap_err();
         assert!(err.to_string().contains("Message too large"));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn send_rejects_oversized_frame_before_writing() -> Result<()> {
+        let (_remote, local) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(local);
+        let peer = PeerConnection::new(Box::new(reader), Box::new(writer), 1);
+        let message = Message::Error {
+            message: "x".repeat(framing::MAX_MESSAGE_BYTES),
+        };
+        let error = timeout(Duration::from_secs(1), peer.send(&message))
+            .await?
+            .unwrap_err();
+        assert!(error.to_string().contains("Message too large"));
         Ok(())
     }
 }
