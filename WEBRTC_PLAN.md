@@ -8,8 +8,9 @@ provider chosen. Build and play instructions are in [README.md](README.md).
 - Shared Rust library and asynchronous session power both frontends.
 - Browser Wasm build, secure browser randomness, and worker crypto self-check
   are implemented.
-- Manual three-way WebRTC setup, optional TURN/relay-only configuration, and
-  complete playable rounds are implemented.
+- Invite links with automatic seats and connection setup, same-browser tab
+  connections, optional TURN/relay-only configuration, and complete playable
+  rounds are implemented. Manual setup remains an advanced static-only fallback.
 - Bounded messages, sender/value validation, round agreement, disconnect
   handling, and regression tests are implemented.
 - Native tests, simulation, and a three-terminal TCP/Ctrl+C smoke check passed.
@@ -18,9 +19,18 @@ provider chosen. Build and play instructions are in [README.md](README.md).
   test passed through a local TURN server with relay-only policy; all six
   endpoints selected relay candidates. The desktop crypto self-check took
   roughly 6–11 seconds in headless Chromium on this test machine.
+- Automatic invite setup passed two full rounds both in three tabs of one
+  browser (no WebRTC overrides or pasted details) and in three isolated browser
+  profiles using WebRTC. The room service and clients have 8 Python HTTP/SSE
+  tests and 18 JavaScript tests.
+
+The local Python server now handles bounded, authenticated, ephemeral signaling
+rooms and serves the app. It does not process gameplay or hold private keys.
+Same-browser tabs connect without WebRTC network discovery; separate devices
+automatically exchange WebRTC offers and answers through the room service.
 
 Still pending: real phone measurements, separate-network internet testing,
-managed hosting/invite links, and an independent cryptographic review. The
+managed hosting, and an independent cryptographic review. The
 inherited raw card encoding has known leakage (index 1 is unchanged by every
 encryption layer), so this prototype cannot promise card secrecy or cheating
 resistance. Hosting remains the later phase described below.
@@ -101,10 +111,11 @@ connections total, two per player. Assign seats once during setup and bind each
 connection to its remote seat. Use a fixed seat order to choose which side
 creates each connection's offer.
 
-Start with manual copy/paste signaling to prove connectivity without building
-a room service. Each pair exchanges an offer and answer after ICE candidate
-collection completes. Explain each pairing in the setup UI. Start the session
-only after all three pairwise channels are confirmed ready.
+The initial connectivity proof used manual copy/paste signaling. This remains
+an advanced fallback for static-only hosting. The default interface now uses
+the room service in phase 6 to exchange each offer and answer automatically.
+Start the session only after all three pairwise channels are confirmed ready.
+Tabs in one browser use local channels instead of network discovery.
 
 Use STUN for direct connection discovery. Test with TURN as well, including a
 forced-relay connection. Without TURN, some networks will not connect; reliable
@@ -159,10 +170,12 @@ files, including Wasm. A signaling service only exchanges connection setup
 information; gameplay and private keys stay on the clients. TURN may relay
 encrypted traffic when a direct connection fails.
 
-Manual setup remains sufficient for the prototype. For invite links, add a
-small signaling service with unguessable room invitations, three-player room
-limits, fixed seat ownership, message limits, and room expiry. Keep provider
-secrets server-side; supply temporary TURN credentials to clients.
+Invite links now use `scripts/serve.py`, a small local signaling service with
+unguessable room invitations, authenticated player tokens, three-player room
+limits, fixed seat ownership, message limits, and room expiry. It also serves
+the static files; plain `python3 -m http.server` supports only the manual fallback.
+Managed deployment and automatic TURN credential issuance remain pending.
+Keep provider secrets server-side; supply temporary TURN credentials to clients.
 
 Cloudflare was discussed as a managed option. A home router was discussed
 as a possible static/signaling host. Neither is selected: router hosting needs

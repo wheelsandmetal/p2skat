@@ -4,18 +4,22 @@ const { execFileSync } = require('node:child_process');
 const { chromium } = require('playwright-core');
 
 async function main() {
+  const manual = process.env.TEST_MANUAL === '1';
+  const remote = manual || process.env.TEST_WEBRTC === '1' || Boolean(process.env.TEST_TURN_URL);
   const browser = await chromium.launch({
     executablePath: process.env.CHROMIUM_PATH || execFileSync('which', ['chromium'], { encoding: 'utf8' }).trim(),
     headless: true,
-    // Local multicast is unavailable in some headless environments.
-    args: ['--no-sandbox', '--disable-features=WebRtcHideLocalIpsWithMdns'],
+    // Actual same-browser testing uses no WebRTC candidate overrides.
+    args: ['--no-sandbox', ...(remote ? ['--disable-features=WebRtcHideLocalIpsWithMdns'] : [])],
   });
+  const sharedContext = remote ? null : await browser.newContext();
   const pages = [];
   const errors = [];
   try {
     for (let seat = 0; seat < 3; seat++) {
-      const context = await browser.newContext({ viewport: seat === 2 ? { width: 390, height: 844 } : { width: 1360, height: 900 } });
+      const context = sharedContext || await browser.newContext();
       const page = await context.newPage();
+      await page.setViewportSize(seat === 2 ? { width: 390, height: 844 } : { width: 1360, height: 900 });
       page.setDefaultTimeout(60000);
       page.on('pageerror', error => errors.push(`Seat ${seat}: ${error.message}`));
       await page.addInitScript(() => {
@@ -59,10 +63,17 @@ async function main() {
     await pages[0].waitForFunction(() => /passed|verified|success/i.test(document.querySelector('#self-check-result').textContent), undefined, { timeout: 120000 });
     console.log('Crypto:', await pages[0].locator('#self-check-result').textContent());
 
+    let invite;
     for (let seat = 0; seat < 3; seat++) {
       const page = pages[seat];
-      await page.locator('#seat').selectOption(String(seat));
-      for (const [index, name] of ['Ada', 'Bert', 'Clara'].entries()) await page.locator(`#name-${index}`).fill(name);
+      if (manual) {
+        await page.locator('#manual-setup summary').click();
+        await page.locator('#seat').selectOption(String(seat));
+        for (const [index, name] of ['Ada', 'Bert', 'Clara'].entries()) await page.locator(`#name-${index}`).fill(name);
+      } else {
+        if (seat > 0) await page.goto(invite);
+        await page.locator('#player-name').fill(['Ada', 'Bert', 'Clara'][seat]);
+      }
       await page.locator('.network-settings summary').click();
       await page.locator('#stun').fill('');
       if (process.env.TEST_TURN_URL) {
@@ -71,10 +82,16 @@ async function main() {
         await page.locator('#turn-credential').fill(process.env.TEST_TURN_CREDENTIAL || '');
         await page.locator('#relay-only').check();
       }
-      await page.locator('#prepare').click();
+      if (manual) await page.locator('#prepare').click();
+      else if (seat === 0) {
+        await page.locator('#create-table').click();
+        await page.waitForFunction(() => document.querySelector('#invite-link')?.value.includes('#room='));
+        invite = await page.locator('#invite-link').inputValue();
+        assert.equal(await page.locator('#open-player-tab').getAttribute('href'), invite);
+      } else await page.locator('#join-table').click();
     }
 
-    for (const [lower, higher] of [[0, 1], [0, 2], [1, 2]]) {
+    for (const [lower, higher] of manual ? [[0, 1], [0, 2], [1, 2]] : []) {
       const out = `[data-peer="${higher}"] .signal-out`;
       await pages[lower].waitForFunction(selector => document.querySelector(selector)?.value.length > 0, out);
       await pages[higher].locator(`[data-peer="${lower}"] .signal-in`).fill(await pages[lower].locator(out).inputValue());
@@ -86,7 +103,11 @@ async function main() {
       console.log(`Paired seats ${lower + 1} and ${higher + 1}.`);
     }
     await Promise.all(pages.map(page => page.locator('#game').waitFor({ state: 'visible' })));
-    console.log('All three WebRTC pairings ready.');
+    console.log(manual ? 'All three manual WebRTC pairings ready.' : 'Invite assigned all three seats and connected automatically.');
+    if (!remote) {
+      assert.deepEqual(await Promise.all(pages.map(page => page.evaluate(() => window.testConnections.length))), [0, 0, 0], 'Same-browser tabs attempted WebRTC network discovery');
+      console.log('Three tabs connected locally without WebRTC overrides or pasted signals.');
+    }
     if (process.env.TEST_TURN_URL) {
       for (const page of pages) {
         const types = await page.evaluate(async () => Promise.all(window.testConnections.map(async connection => {

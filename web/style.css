@@ -203,17 +203,117 @@ main {
   line-height:1.75;
 }
 
-.setup-panel form {
+.setup-card {
   background:#fffdf6;
   border:1px solid var(--line);
   border-radius:12px;
   padding:28px;
 }
 
-.setup-panel form h2 {
+.setup-card h2 {
   font-family:Georgia,serif;
   font-size:26px;
   font-weight:400;
+}
+
+.room-buttons {
+  margin-top:20px;
+}
+
+#manual-setup {
+  border-top:1px solid var(--line);
+  margin-top:18px;
+}
+
+#manual-setup h2 {
+  font-size:22px;
+  margin-top:14px;
+}
+
+#prepare {
+  margin-top:18px;
+}
+
+.room-lobby {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:56px;
+  align-items:start;
+}
+
+.room-lobby h1 {
+  font-size:52px;
+}
+
+.room-lobby>div>p {
+  max-width:460px;
+  font-size:14px;
+  line-height:1.75;
+}
+
+.invite-panel {
+  background:var(--cream);
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:26px;
+  min-width:0;
+}
+
+.invite-panel>.action-buttons {
+  margin-top:12px;
+}
+
+.button-link {
+  display:inline-flex;
+  min-height:44px;
+  align-items:center;
+  justify-content:center;
+  padding:10px 16px;
+  border:1px solid #bdcbbd;
+  border-radius:7px;
+  font-size:13px;
+  font-weight:650;
+  text-decoration:none;
+}
+
+.button-link:hover {
+  background:#e5eddf;
+}
+
+#room-players {
+  list-style:none;
+  margin:24px 0 18px;
+  padding:0;
+}
+
+.room-player {
+  display:flex;
+  align-items:center;
+  gap:12px;
+  padding:12px 0;
+  border-bottom:1px solid var(--line);
+  color:var(--muted);
+  font-size:13px;
+  overflow-wrap:anywhere;
+}
+
+.room-player.present {
+  color:var(--green);
+  font-weight:650;
+}
+
+.room-seat {
+  display:grid;
+  place-items:center;
+  width:32px;
+  height:32px;
+  border-radius:50%;
+  border:1px solid var(--line);
+  flex-shrink:0;
+}
+
+.room-player.present .room-seat {
+  background:#e7eedf;
 }
 
 .hint {
@@ -763,6 +863,13 @@ footer p:last-child {
 }
 
 @media(max-width:780px) {
+  .room-lobby {
+    grid-template-columns:1fr;
+    gap:22px;
+  }
+  .room-lobby h1 {
+    font-size:42px;
+  }
   .masthead {
     padding:18px 22px;
     min-height:80px;
@@ -788,7 +895,7 @@ footer p:last-child {
     max-width:550px;
     margin-bottom:0;
   }
-  .setup-panel form {
+  .setup-card {
     padding:24px;
   }
   .table-layout {
@@ -824,6 +931,12 @@ footer p:last-child {
 }
 
 @media(max-width:480px) {
+  .room-lobby h1 {
+    font-size:36px;
+  }
+  .invite-panel {
+    padding:20px;
+  }
   .tagline {
     display:none;
   }
@@ -842,14 +955,14 @@ footer p:last-child {
   .intro p {
     font-size:14px;
   }
-  .setup-panel form {
+  .setup-card {
     padding:20px;
   }
   .setup-grid {
     gap:14px;
     grid-template-columns:1fr;
   }
-  .setup-panel form .setup-grid label:first-child:nth-last-child(4) {
+  .setup-card .setup-grid label:first-child:nth-last-child(4) {
     grid-column:auto;
   }
   .privacy {

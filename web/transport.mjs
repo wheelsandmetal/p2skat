@@ -128,8 +128,64 @@ function waitForIce(connection) {
   });
 }
 
+// Same-browser tabs need no network discovery or signaling exchange.
+export class LocalDataChannel {
+  constructor(room, seat, remote) {
+    if (!/^[\w-]{16,128}$/.test(room) || seat === remote ||
+        ![seat, remote].every(value => Number.isInteger(value) && value >= 0 && value < 3)) {
+      throw new Error('Invalid local table pairing.');
+    }
+    this.label = 'p2skat';
+    this.ordered = true;
+    this.maxRetransmits = this.maxPacketLifeTime = null;
+    this.bufferedAmount = 0;
+    this.readyState = 'connecting';
+    this.seat = seat;
+    this.remote = remote;
+    this.channel = new BroadcastChannel(`p2skat:${room}:${Math.min(seat, remote)}:${Math.max(seat, remote)}`);
+    this.channel.onmessage = ({ data }) => {
+      if (this.readyState === 'closed') return;
+      try {
+        if (!data || data.seat !== remote || data.to !== seat) throw new Error('Invalid local sender.');
+        if (data.type === 'connect') {
+          this.post('connected');
+          this.open();
+        } else if (data.type === 'connected') this.open();
+        else if (data.type === 'data' && this.readyState === 'open') this.onmessage?.({ data: checkText(data.body) });
+        else if (data.type === 'closed') this.close(false);
+        else throw new Error('Invalid local connection message.');
+      } catch (error) { this.onerror?.(error); }
+    };
+    this.channel.onmessageerror = () => this.onerror?.(new Error('Unreadable local connection message.'));
+    this.post('connect');
+  }
+
+  post(type, body) {
+    this.channel.postMessage({ type, seat: this.seat, to: this.remote, body });
+  }
+
+  open() {
+    if (this.readyState !== 'connecting') return;
+    this.readyState = 'open';
+    this.onopen?.();
+  }
+
+  send(text) {
+    if (this.readyState !== 'open') throw new Error('Local player connection is not open.');
+    this.post('data', checkText(text));
+  }
+
+  close(notify = true) {
+    if (this.readyState === 'closed') return;
+    this.readyState = 'closed';
+    if (notify) this.post('closed');
+    this.channel.close();
+    this.onclose?.();
+  }
+}
+
 export class PeerMesh {
-  constructor({ seat, names, configuration, onSignal, onStatus, onMessage, onReady, onFailure }) {
+  constructor({ seat, names, configuration, localRoom, localPeers = [], onSignal, onStatus, onMessage, onReady, onFailure }) {
     this.seat = seat;
     this.names = validateNames(names);
     this.readiness = new MeshReadiness(seat, names);
@@ -144,6 +200,12 @@ export class PeerMesh {
     this.started = false;
     for (let remote = 0; remote < 3; remote++) {
       if (remote === seat) continue;
+      if (localPeers.includes(remote)) {
+        const channel = new LocalDataChannel(localRoom, seat, remote);
+        this.peers.set(remote, { connection: { close: () => channel.close() }, local: true });
+        this.attach(remote, channel);
+        continue;
+      }
       const connection = new RTCPeerConnection(configuration);
       const peer = { connection, channel: null, applying: false };
       this.peers.set(remote, peer);
@@ -166,7 +228,7 @@ export class PeerMesh {
 
   async prepare() {
     await Promise.all([...this.peers].map(async ([remote, peer]) => {
-      if (this.seat < remote) {
+      if (!peer.local && this.seat < remote) {
         await peer.connection.setLocalDescription(await peer.connection.createOffer());
         await this.publishSignal(remote);
       }

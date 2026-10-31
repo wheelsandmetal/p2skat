@@ -16,16 +16,14 @@
   </header>
   <main>
     <section id="setup" class="setup-panel" aria-labelledby="setup-heading">
-      <div class="intro"><span class="eyebrow">THE BROWSER TABLE · PROTOTYPE</span><h1 id="setup-heading">Good cards.<br>Better company.</h1><p>Bring two friends. Shuffle privately, bid together, and play a full game of Skat in your browsers.</p></div>
-      <form id="setup-form">
-        <h2>Set your table</h2>
-        <p class="hint">Choose a different seat on each device. Enter the same three names, in the same order, everywhere.</p>
-        <div class="setup-grid">
-          <label>Your seat<select id="seat"><option value="0">Seat 1 · first forehand</option><option value="1">Seat 2 · first middlehand</option><option value="2">Seat 3 · first rearhand</option></select></label>
-          <label>Seat 1 name<input id="name-0" value="Player 1" maxlength="40" required autocomplete="off"></label>
-          <label>Seat 2 name<input id="name-1" value="Player 2" maxlength="40" required autocomplete="off"></label>
-          <label>Seat 3 name<input id="name-2" value="Player 3" maxlength="40" required autocomplete="off"></label>
-        </div>
+      <div class="intro"><span class="eyebrow">THE BROWSER TABLE · PROTOTYPE</span><h1 id="setup-heading">Good cards.<br>Better company.</h1><p>Bring two friends. Shuffle the deck, bid together, and play a full game of Skat in your browsers.</p></div>
+      <div class="setup-card">
+        <form id="room-form">
+          <h2 id="room-heading">Set your table</h2>
+          <p id="room-intro" class="hint">Create a table and send the invite to two friends. We’ll handle the connections.</p>
+          <label>Your name<input id="player-name" maxlength="40" required autocomplete="nickname" placeholder="What should we call you?"></label>
+          <div class="action-buttons room-buttons"><button id="create-table" type="submit" class="primary">Create table <span aria-hidden="true">↗</span></button><button id="join-table" type="button" class="primary" hidden>Join table <span aria-hidden="true">↗</span></button></div>
+        </form>
         <details class="network-settings"><summary>Network settings · STUN &amp; TURN</summary>
           <div class="setup-grid">
             <label>STUN URL<input id="stun" value="stun:stun.l.google.com:19302" spellcheck="false" autocomplete="off"></label>
@@ -37,8 +35,25 @@
           <p class="hint">Use temporary client credentials from your TURN provider. Never enter a server admin password or signing secret.</p>
         </details>
         <p class="privacy">Direct connections can reveal your IP address to the other players. This browser version does not provide Tor anonymity. Some networks need TURN to connect; without a working relay, setup may fail.</p>
-        <button id="prepare" type="submit" class="primary">Prepare connections <span aria-hidden="true">↗</span></button>
-      </form>
+        <details id="manual-setup"><summary>Advanced · manual connection setup</summary>
+          <form id="setup-form">
+            <h2>Connect manually</h2>
+            <p class="hint">For static hosting without an invite service. Choose a different seat on each device. Enter the same three names, in the same order, everywhere.</p>
+            <div class="setup-grid">
+              <label>Your seat<select id="seat"><option value="0">Seat 1 · first forehand</option><option value="1">Seat 2 · first middlehand</option><option value="2">Seat 3 · first rearhand</option></select></label>
+              <label>Seat 1 name<input id="name-0" value="Player 1" maxlength="40" required autocomplete="off"></label>
+              <label>Seat 2 name<input id="name-1" value="Player 2" maxlength="40" required autocomplete="off"></label>
+              <label>Seat 3 name<input id="name-2" value="Player 3" maxlength="40" required autocomplete="off"></label>
+            </div>
+            <button id="prepare" type="submit" class="primary">Prepare connections <span aria-hidden="true">↗</span></button>
+          </form>
+        </details>
+      </div>
+    </section>
+
+    <section id="room-lobby" class="room-lobby" aria-labelledby="lobby-heading" hidden>
+      <div><span class="eyebrow">A SEAT FOR EVERYONE</span><h1 id="lobby-heading">Your friends are invited.</h1><p>Share this link with two friends, or open two player tabs to try the table on this browser. The game starts when everyone joins.</p></div>
+      <div class="invite-panel"><label>Table invite<input id="invite-link" readonly spellcheck="false"></label><div class="action-buttons"><button id="copy-invite">Copy invite</button><a id="open-player-tab" class="button-link" target="_blank" rel="noopener">Open another player tab</a></div><ol id="room-players" aria-label="Players at your table" aria-live="polite"></ol><p id="room-progress" class="hint">Waiting for the table to fill.</p></div>
     </section>
 
     <section id="connections" class="connection-panel" aria-labelledby="connections-heading" hidden>
@@ -63,6 +78,6 @@
 
     <section class="self-check"><div><h2>Check your browser</h2><p>Run the real 2048-bit shuffle, deal, and verification on this device. Crypto runs in a worker so the table stays responsive.</p></div><div><button id="self-check">Run crypto self-check</button><p id="self-check-result" role="status" aria-live="polite"></p></div></section>
   </main>
-  <footer><span>♠ &nbsp; p2skat</span><p>Three players. One shared game. No accounts.</p><p>Prototype · custom card encryption has not had an independent security review.</p></footer>
+  <footer><span>♠ &nbsp; p2skat</span><p>Three players. One shared game. No accounts.</p><p>Prototype · card secrecy and cheating resistance are not guaranteed.</p></footer>
 </body>
 </html>

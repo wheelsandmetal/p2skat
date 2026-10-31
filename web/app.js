@@ -1,9 +1,13 @@
 import { PeerMesh, MessageQueue, iceConfiguration, validateNames } from './transport.mjs';
+import { RoomClient, browserMarker } from './rooms.mjs';
 
 const $ = id => document.getElementById(id);
 const ui = { seat: 0, names: [], hand: [], scores: [0, 0, 0], turn: null, choice: null, selected: new Set(), finished: false };
 let mesh = null;
 let worker = null;
+let room = null;
+let roomMeshReady = null;
+const pendingSignals = [];
 const incoming = new MessageQueue();
 const peerPanels = new Map();
 
@@ -30,6 +34,7 @@ function stop(message, error = false) {
   ui.choice = null;
   ui.turn = null;
   mesh?.close();
+  room?.close().catch(() => {});
   incoming.clear();
   worker?.postMessage({ type: 'cancel' });
   worker?.terminate();
@@ -48,7 +53,7 @@ function stop(message, error = false) {
   status(message, error);
   const restart = element('button', 'quiet', 'Set up a new table');
   restart.id = 'restart';
-  restart.addEventListener('click', () => location.reload());
+  restart.addEventListener('click', () => { location.href = location.pathname + location.search; });
   $('connection-state').parentElement.append(restart);
 }
 
@@ -87,7 +92,146 @@ $('self-check').addEventListener('click', () => {
 });
 
 $('leave').addEventListener('click', () => stop('You left the table. The other players have been notified.'));
-window.addEventListener('pagehide', () => { mesh?.close(); worker?.terminate(); });
+window.addEventListener('pagehide', () => { mesh?.close(); room?.close().catch(() => {}); worker?.terminate(); });
+
+function networkConfiguration() {
+  if (!window.RTCPeerConnection || !window.Worker || !window.isSecureContext) {
+    throw new Error('Use a browser with WebRTC and Web Workers over HTTPS, or localhost for development.');
+  }
+  return iceConfiguration({ stun: $('stun').value, turn: $('turn-url').value,
+    username: $('turn-username').value, credential: $('turn-credential').value, relayOnly: $('relay-only').checked });
+}
+
+function startMesh(configuration, localPeers = []) {
+  mesh = new PeerMesh({ seat: ui.seat, names: ui.names, configuration, localPeers, localRoom: room?.room,
+    onSignal: (remote, text) => {
+      if (room) {
+        room.sendSignal(remote, text).catch(error => stop(error.message, true));
+      } else {
+        const panel = peerPanels.get(remote);
+        panel.outgoing.value = text;
+        panel.copy.disabled = false;
+      }
+    },
+    onStatus: (remote, text) => {
+      if (room) $('room-progress').textContent = 'Connecting everyone to the table…';
+      else peerPanels.get(remote).detail.textContent = text;
+    },
+    onMessage: (seat, json) => incoming.push(seat, json),
+    onFailure: error => stop(error.message, true),
+    onReady: () => {
+      $('connections').hidden = true;
+      $('room-lobby').hidden = true;
+      $('game').hidden = false;
+      $('self-check').disabled = true;
+      status('All three players connected. Starting game…');
+      renderPlayers();
+      const gameWorker = getWorker();
+      gameWorker.postMessage({ type: 'start', config: { seat: ui.seat, names: ui.names } });
+      incoming.start((seat, json) => gameWorker.postMessage({ type: 'receive', seat, json }));
+    },
+  });
+  return mesh.prepare();
+}
+
+async function applyRoomSignal(event) {
+  try {
+    await roomMeshReady;
+    if (!ui.finished) await mesh.apply(event.from, event.signal);
+  } catch (error) { stop(error.message, true); }
+}
+
+function showRoomPlayers(players, configuration, marker) {
+  $('room-players').replaceChildren(...[0, 1, 2].map(seat => {
+    const player = players.find(player => player.seat === seat);
+    const item = element('li', `room-player${player ? ' present' : ''}`);
+    item.append(element('span', 'room-seat', `${seat + 1}`), element('span', '', player ? `${player.name}${seat === ui.seat ? ' (you)' : ''}` : 'Waiting for a friend…'));
+    return item;
+  }));
+  if (players.length < 3) {
+    $('room-progress').textContent = `${players.length} of 3 players here. Share your invite to fill the table.`;
+    return;
+  }
+  const names = validateNames(players.map(player => player.name));
+  if (mesh) {
+    if (JSON.stringify(names) !== JSON.stringify(ui.names)) stop('The table’s player list changed unexpectedly.', true);
+    return;
+  }
+  ui.names = names;
+  $('room-progress').textContent = 'Everyone is here. Connecting your table…';
+  const localPeers = typeof BroadcastChannel === 'function' && configuration.iceTransportPolicy !== 'relay'
+    ? players.filter(player => player.seat !== ui.seat && player.browser === marker).map(player => player.seat) : [];
+  roomMeshReady = startMesh(configuration, localPeers);
+  roomMeshReady.catch(error => stop(error.message, true));
+  for (const signal of pendingSignals.splice(0)) void applyRoomSignal(signal);
+}
+
+let invitedRoom;
+function updateInvite() {
+  if (room || mesh) return;
+  invitedRoom = new URLSearchParams(location.hash.slice(1)).get('room');
+  $('room-heading').textContent = invitedRoom ? 'Your seat is waiting' : 'Set your table';
+  $('room-intro').textContent = invitedRoom
+    ? 'Enter your name and join your friends. We’ll connect the table automatically.'
+    : 'Create a table and send the invite to two friends. We’ll handle the connections.';
+  $('create-table').hidden = Boolean(invitedRoom);
+  $('join-table').hidden = !invitedRoom;
+}
+updateInvite();
+window.addEventListener('hashchange', updateInvite);
+
+async function enterRoom() {
+  if (!$('room-form').reportValidity()) return;
+  $('create-table').disabled = $('join-table').disabled = true;
+  try {
+    const configuration = networkConfiguration();
+    const name = $('player-name').value.trim();
+    if (!name) throw new Error('Enter your name to join the table.');
+    const marker = typeof BroadcastChannel === 'function' && configuration.iceTransportPolicy !== 'relay'
+      ? browserMarker() : crypto.randomUUID();
+    room = await RoomClient.enter({ room: invitedRoom, name, browser: marker });
+    ui.seat = room.seat;
+    const invite = new URL(location.href);
+    invite.hash = `room=${room.room}`;
+    $('invite-link').value = invite.href;
+    $('open-player-tab').href = invite.href;
+    $('setup').hidden = true;
+    $('room-lobby').hidden = false;
+    $('leave').hidden = false;
+    status(`You’re at the table · seat ${ui.seat + 1}.`);
+    room.listen(event => {
+      if (event.type === 'players') showRoomPlayers(event.players, configuration, marker);
+      else if (event.type === 'closed') stop(event.message);
+      else if (mesh) void applyRoomSignal(event);
+      else {
+        if (pendingSignals.length >= 4) throw new Error('Too many connection details arrived before the table was ready.');
+        pendingSignals.push(event);
+      }
+    }, error => {
+      if (!mesh?.started) stop(error.message, true);
+    });
+    showRoomPlayers(room.players, configuration, marker);
+  } catch (error) {
+    if (room || mesh) stop(error.message, true);
+    else {
+      status(error.message, true);
+      $('create-table').disabled = $('join-table').disabled = false;
+    }
+  }
+}
+
+$('room-form').addEventListener('submit', event => { event.preventDefault(); void enterRoom(); });
+$('join-table').addEventListener('click', () => void enterRoom());
+$('copy-invite').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText($('invite-link').value);
+    $('copy-invite').textContent = 'Invite copied';
+  } catch {
+    $('invite-link').focus();
+    $('invite-link').select();
+    $('room-progress').textContent = 'Copy the highlighted invite link and send it to your friends.';
+  }
+});
 
 function buildPeerPanel(remote) {
   const panel = element('section', 'peer-panel');
@@ -140,40 +284,16 @@ function buildPeerPanel(remote) {
 $('setup-form').addEventListener('submit', async event => {
   event.preventDefault();
   try {
-    if (!window.RTCPeerConnection || !window.Worker || !window.isSecureContext) {
-      throw new Error('Use a browser with WebRTC and Web Workers over HTTPS, or localhost for development.');
-    }
+    const configuration = networkConfiguration();
     ui.seat = Number($('seat').value);
     ui.names = validateNames([0, 1, 2].map(seat => $(`name-${seat}`).value.trim()));
-    const configuration = iceConfiguration({ stun: $('stun').value, turn: $('turn-url').value,
-      username: $('turn-username').value, credential: $('turn-credential').value, relayOnly: $('relay-only').checked });
     $('peer-connections').replaceChildren();
     for (let remote = 0; remote < 3; remote++) if (remote !== ui.seat) $('peer-connections').append(buildPeerPanel(remote));
-    mesh = new PeerMesh({ seat: ui.seat, names: ui.names, configuration,
-      onSignal: (remote, text) => {
-        const panel = peerPanels.get(remote);
-        panel.outgoing.value = text;
-        panel.copy.disabled = false;
-      },
-      onStatus: (remote, text) => { peerPanels.get(remote).detail.textContent = text; },
-      onMessage: (seat, json) => incoming.push(seat, json),
-      onFailure: error => stop(error.message, true),
-      onReady: () => {
-        $('connections').hidden = true;
-        $('game').hidden = false;
-        $('self-check').disabled = true;
-        status('All three players connected. Starting game…');
-        renderPlayers();
-        const gameWorker = getWorker();
-        gameWorker.postMessage({ type: 'start', config: { seat: ui.seat, names: ui.names } });
-        incoming.start((seat, json) => gameWorker.postMessage({ type: 'receive', seat, json }));
-      },
-    });
     $('setup').hidden = true;
     $('connections').hidden = false;
     $('leave').hidden = false;
     status(`You are ${ui.names[ui.seat]} · seat ${ui.seat + 1}. Connect both pairings below.`);
-    await mesh.prepare();
+    await startMesh(configuration);
   } catch (error) {
     if (mesh) stop(error.message, true);
     else status(error.message, true);
