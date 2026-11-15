@@ -185,7 +185,7 @@ export class LocalDataChannel {
 }
 
 export class PeerMesh {
-  constructor({ seat, names, configuration, localRoom, localPeers = [], onSignal, onStatus, onMessage, onReady, onFailure }) {
+  constructor({ seat, names, configuration, localRoom, localPeers = [], relay = null, relayPeers = [], onSignal, onStatus, onMessage, onReady, onFailure }) {
     this.seat = seat;
     this.names = validateNames(names);
     this.readiness = new MeshReadiness(seat, names);
@@ -203,6 +203,13 @@ export class PeerMesh {
       if (localPeers.includes(remote)) {
         const channel = new LocalDataChannel(localRoom, seat, remote);
         this.peers.set(remote, { connection: { close: () => channel.close() }, local: true });
+        this.attach(remote, channel);
+        continue;
+      }
+      if (relayPeers.includes(remote)) {
+        // End-to-end encrypted frames through the table server (web/relay.mjs).
+        const channel = relay.channel(remote);
+        this.peers.set(remote, { connection: { close: () => channel.close() }, relay: true });
         this.attach(remote, channel);
         continue;
       }
@@ -228,7 +235,7 @@ export class PeerMesh {
 
   async prepare() {
     await Promise.all([...this.peers].map(async ([remote, peer]) => {
-      if (!peer.local && this.seat < remote) {
+      if (!peer.local && !peer.relay && this.seat < remote) {
         await peer.connection.setLocalDescription(await peer.connection.createOffer());
         await this.publishSignal(remote);
       }

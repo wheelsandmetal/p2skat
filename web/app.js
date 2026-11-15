@@ -1,5 +1,6 @@
 import { PeerMesh, MessageQueue, iceConfiguration, validateNames } from './transport.mjs';
 import { RoomClient, browserMarker } from './rooms.mjs';
+import { RelaySession, newInviteSecret, parseInviteSecret, relayInviteFragment } from './relay.mjs';
 
 const $ = id => document.getElementById(id);
 const ui = { seat: 0, names: [], hand: [], scores: [0, 0, 0], turn: null, choice: null, selected: new Set(), finished: false };
@@ -7,7 +8,11 @@ let mesh = null;
 let worker = null;
 let room = null;
 let roomMeshReady = null;
+let relay = null;
+let tableMode = null;
+let inviteSecret = null;
 const pendingSignals = [];
+const pendingRelay = [];
 const incoming = new MessageQueue();
 const peerPanels = new Map();
 
@@ -34,6 +39,7 @@ function stop(message, error = false) {
   ui.choice = null;
   ui.turn = null;
   mesh?.close();
+  relay?.close();
   room?.close().catch(() => {});
   incoming.clear();
   worker?.postMessage({ type: 'cancel' });
@@ -105,7 +111,51 @@ document.addEventListener('fullscreenchange', () => {
   fullscreen.setAttribute('aria-label', label);
   fullscreen.title = label;
 });
-window.addEventListener('pagehide', () => { mesh?.close(); room?.close().catch(() => {}); worker?.terminate(); });
+window.addEventListener('pagehide', () => { mesh?.close(); relay?.close(); room?.close().catch(() => {}); worker?.terminate(); });
+
+// Tor Browser has no RTCPeerConnection; an onion page must not leak IPs through WebRTC either.
+// Either forces relay mode, where the table server forwards end-to-end encrypted frames.
+const relayReason = typeof window.RTCPeerConnection !== 'function'
+  ? 'This browser has no WebRTC (Tor Browser turns it off), so the game goes through the table server, end-to-end encrypted. STUN and TURN are not used.'
+  : /\.onion$/i.test(location.hostname)
+    ? 'This page is served over Tor, so the game goes through the table server, end-to-end encrypted, and no direct connections reveal your IP address. STUN and TURN are not used.'
+    : null;
+const viaTor = relayReason !== null;
+const shuffleText = viaTor ? 'Shuffling over Tor, this can take half a minute…' : 'Shuffling through the table server…';
+
+function readInvite() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  return { room: params.get('room'), secret: params.get('k'), mode: params.get('m') };
+}
+
+// Decided before anything touches WebRTC: networkConfiguration() needs RTCPeerConnection.
+function intendedMode(invite = readInvite()) {
+  if (relayReason || invite.mode === 'relay') return 'relay';
+  if (invite.room) return 'webrtc';
+  return $('relay-mode').checked ? 'relay' : 'webrtc';
+}
+
+function updateNetworkUi() {
+  const invite = readInvite();
+  const relayMode = intendedMode(invite) === 'relay';
+  $('ice-settings').hidden = relayMode;
+  $('relay-choice').hidden = Boolean(relayReason || invite.room);
+  $('relay-note').hidden = !relayMode;
+  $('relay-note').textContent = relayReason || (invite.room
+    ? 'This table routes the game through the table server, end-to-end encrypted. STUN and TURN are not used.'
+    : 'The table server forwards end-to-end encrypted game messages. No direct connections, so STUN and TURN are not used.');
+  $('privacy').textContent = relayMode
+    ? `Other players never learn your IP address${/\.onion$/i.test(location.hostname) ? ', and over Tor neither does the table server' : '; the table server does, unless you use Tor'}. Keep this tab open: reloading it ends the game.`
+    : 'Direct peers can see your IP. No Tor anonymity. Some networks need a working TURN relay to connect.';
+}
+$('relay-mode').addEventListener('change', updateNetworkUi);
+
+function capabilityProblem() {
+  if (typeof WebAssembly === 'undefined') return 'This browser blocks WebAssembly, which the card crypto needs. In Tor Browser, set Security Level to Standard for this site.';
+  if (!window.isSecureContext || !globalThis.crypto?.subtle) return 'Open this page over HTTPS, an .onion address, or localhost: the browser only offers its crypto there.';
+  if (!window.Worker) return 'This browser cannot run the game in a background worker.';
+  return null;
+}
 
 function networkConfiguration() {
   if (!window.RTCPeerConnection || !window.Worker || !window.isSecureContext) {
@@ -115,8 +165,8 @@ function networkConfiguration() {
     username: $('turn-username').value, credential: $('turn-credential').value, relayOnly: $('relay-only').checked });
 }
 
-function startMesh(configuration, localPeers = []) {
-  mesh = new PeerMesh({ seat: ui.seat, names: ui.names, configuration, localPeers, localRoom: room?.room,
+function startMesh(configuration, localPeers = [], relayPeers = []) {
+  mesh = new PeerMesh({ seat: ui.seat, names: ui.names, configuration, localPeers, localRoom: room?.room, relay, relayPeers,
     onSignal: (remote, text) => {
       if (room) {
         room.sendSignal(remote, text).catch(error => stop(error.message, true));
@@ -127,7 +177,7 @@ function startMesh(configuration, localPeers = []) {
       }
     },
     onStatus: (remote, text) => {
-      if (room) $('room-progress').textContent = 'Connecting…';
+      if (room) $('room-progress').textContent = relay ? 'Keys exchanged · waiting for everyone…' : 'Connecting…';
       else peerPanels.get(remote).detail.textContent = text;
     },
     onMessage: (seat, json) => incoming.push(seat, json),
@@ -137,7 +187,8 @@ function startMesh(configuration, localPeers = []) {
       $('room-lobby').hidden = true;
       $('game').hidden = false;
       $('self-check').disabled = true;
-      status('3 players connected');
+      status(relay ? '3 players connected through the table server · end-to-end encrypted' : '3 players connected');
+      if (relay) $('game-status').textContent = shuffleText;
       renderPlayers();
       const gameWorker = getWorker();
       gameWorker.postMessage({ type: 'start', config: { seat: ui.seat, names: ui.names } });
@@ -171,6 +222,17 @@ function showRoomPlayers(players, configuration, marker) {
     return;
   }
   ui.names = names;
+  if (tableMode === 'relay') {
+    $('room-progress').textContent = 'Everyone’s here. Exchanging keys…';
+    relay = new RelaySession({ roomId: room.room, seat: ui.seat, names, secret: inviteSecret,
+      post: (body, signal) => room.sendFrames(body, signal), getAck: () => room.lastEventId,
+      onFatal: error => stop(error.message, true) });
+    roomMeshReady = startMesh(null, [], [0, 1, 2].filter(seat => seat !== ui.seat));
+    roomMeshReady.catch(error => stop(error.message, true));
+    relay.start();
+    for (const event of pendingRelay.splice(0)) relay.receive(event);
+    return;
+  }
   $('room-progress').textContent = 'Everyone’s here. Connecting…';
   const localPeers = typeof BroadcastChannel === 'function' && configuration.iceTransportPolicy !== 'relay'
     ? players.filter(player => player.seat !== ui.seat && player.browser === marker).map(player => player.seat) : [];
@@ -182,7 +244,8 @@ function showRoomPlayers(players, configuration, marker) {
 let invitedRoom;
 function updateInvite() {
   if (room || mesh) return;
-  invitedRoom = new URLSearchParams(location.hash.slice(1)).get('room');
+  invitedRoom = readInvite().room;
+  updateNetworkUi();
   $('room-heading').textContent = invitedRoom ? 'Take your seat.' : 'Let’s play.';
   $('room-intro').textContent = invitedRoom
     ? 'Your friends are waiting.'
@@ -192,36 +255,68 @@ function updateInvite() {
 }
 updateInvite();
 window.addEventListener('hashchange', updateInvite);
+const unsupported = capabilityProblem();
+if (unsupported) {
+  status(unsupported, true);
+  for (const id of ['create-table', 'join-table', 'prepare', 'self-check']) $(id).disabled = true;
+}
 
 async function enterRoom() {
   if (!$('room-form').reportValidity()) return;
   $('create-table').disabled = $('join-table').disabled = true;
   try {
-    const configuration = networkConfiguration();
+    const unsupportedNow = capabilityProblem();
+    if (unsupportedNow) throw new Error(unsupportedNow);
+    const inviteParams = readInvite();
+    if (inviteParams.mode !== null && inviteParams.mode !== 'relay') throw new Error('This invite link is invalid.');
+    const mode = intendedMode(inviteParams);
+    let configuration = null;
+    if (mode === 'relay' && invitedRoom && inviteParams.mode !== 'relay' && !inviteParams.secret) {
+      throw new Error('This invite is for a table with direct WebRTC connections, which this browser cannot make, or the link is incomplete. Ask for a table that routes the game through the table server.');
+    }
+    if (mode === 'relay') inviteSecret = invitedRoom ? parseInviteSecret(inviteParams.secret) : newInviteSecret();
+    else configuration = networkConfiguration();
     const name = $('player-name').value.trim();
     if (!name) throw new Error('Enter your name to join the table.');
-    const marker = typeof BroadcastChannel === 'function' && configuration.iceTransportPolicy !== 'relay'
+    // The same-browser BroadcastChannel shortcut is WebRTC-mode only.
+    const marker = mode === 'webrtc' && typeof BroadcastChannel === 'function' && configuration.iceTransportPolicy !== 'relay'
       ? browserMarker() : crypto.randomUUID();
-    room = await RoomClient.enter({ room: invitedRoom, name, browser: marker });
+    try {
+      room = await RoomClient.enter({ room: invitedRoom, name, browser: marker, mode });
+    } catch (error) {
+      if (error.code !== 'wrong_mode') throw error;
+      throw new Error(mode === 'relay'
+        ? 'This table uses direct WebRTC connections, which this browser cannot or should not make. Ask for a table that routes the game through the table server.'
+        : 'This table routes the game through the table server, but the invite link lacks that setting. Ask for the complete invite link again.');
+    }
+    tableMode = mode;
     ui.seat = room.seat;
     const invite = new URL(location.href);
-    invite.hash = `room=${room.room}`;
+    invite.hash = mode === 'relay' ? relayInviteFragment(room.room, inviteSecret) : `room=${room.room}`;
     $('invite-link').value = invite.href;
     $('open-player-tab').href = invite.href;
     $('setup').hidden = true;
     $('room-lobby').hidden = false;
     $('leave').hidden = false;
+    $('relay-warning').hidden = mode !== 'relay';
     status(`You’re at the table · seat ${ui.seat + 1}.`);
     room.listen(event => {
       if (event.type === 'players') showRoomPlayers(event.players, configuration, marker);
       else if (event.type === 'closed') stop(event.message);
-      else if (mesh) void applyRoomSignal(event);
+      else if (event.type === 'relay') {
+        if (relay) relay.receive(event);
+        else {
+          if (pendingRelay.length >= 8) throw new Error('Too many messages arrived before the table was ready.');
+          pendingRelay.push(event);
+        }
+      } else if (mesh) void applyRoomSignal(event);
       else {
         if (pendingSignals.length >= 4) throw new Error('Too many connection details arrived before the table was ready.');
         pendingSignals.push(event);
       }
     }, error => {
-      if (!mesh?.started) stop(error.message, true);
+      // A relay game lives on this stream; a WebRTC game no longer needs it once started.
+      if (tableMode === 'relay' || !mesh?.started) stop(error.message, true);
     });
     showRoomPlayers(room.players, configuration, marker);
   } catch (error) {
@@ -518,6 +613,7 @@ function renderEvent(event) {
     renderTrick([]);
     note(`Round ${event.number} · a fresh deck.`);
   } else if (event.type === 'status') {
+    if (relay && /^Shuffling/.test(event.message)) event = { ...event, message: shuffleText };
     $('game-status').textContent = event.message;
     if (!ui.choice) $('prompt-heading').textContent = 'At the table';
     note(event.message);

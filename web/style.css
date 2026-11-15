@@ -106,7 +106,10 @@ summary { cursor: pointer; padding: 12px 0; font-size: 11px; color: #c3cec2; }
 .setup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; padding: 12px 0 18px; }
 .optional { display: contents; color: var(--muted); font-weight: 400; }
 .checkbox { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
-.network-settings > p { margin-bottom: 16px; }
+.network-settings > p, #ice-settings > p { margin-bottom: 16px; }
+#relay-note { color: #cfbb88; }
+#relay-warning { margin-top: 14px; color: #cfbb88; }
+.noscript-warning { margin: 24px auto; max-width: 640px; padding: 16px 20px; border: 1px solid #c98e79; border-radius: 8px; color: #f3dfd5; }
 #manual-setup h2 { font-size: 24px; margin-top: 12px; }
 #manual-setup .hint { margin: 12px 0; }
 .self-check { margin: 22px 0 16px; padding-top: 20px; border-top: 1px solid var(--line); }

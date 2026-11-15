@@ -84,3 +84,115 @@ test('seat response must belong to this player and browser', async () => {
   await assert.rejects(() => RoomClient.enter({ name: 'Someone else', browser: players[0].browser,
     fetcher: async () => response({ room: roomId, token, seat: 0, players }) }), /another player/);
 });
+
+// Relay tables -----------------------------------------------------------------
+
+class FakeTimers {
+  constructor() { this.tasks = new Map(); this.next = 1; }
+  setTimeout(fn, ms) { const id = this.next++; this.tasks.set(id, { fn, ms, repeat: false }); return id; }
+  setInterval(fn, ms) { const id = this.next++; this.tasks.set(id, { fn, ms, repeat: true }); return id; }
+  clearTimeout(id) { this.tasks.delete(id); }
+  clearInterval(id) { this.tasks.delete(id); }
+  run() { for (const [id, task] of [...this.tasks]) { if (!task.repeat) this.tasks.delete(id); task.fn(); } }
+}
+
+class FakeEventSource {
+  static instances = [];
+  constructor(url) { this.url = url; this.readyState = 0; this.listeners = {}; FakeEventSource.instances.push(this); }
+  addEventListener(type, fn) { this.listeners[type] = fn; }
+  close() { this.closed = true; this.readyState = 2; }
+}
+
+test('relay seats ask for relay mode and refuse a server that answers with another mode', async () => {
+  const bodies = [];
+  const fetcher = mode => async (path, options) => {
+    bodies.push(JSON.parse(options.body));
+    return response({ room: roomId, token, seat: 0, players, mode });
+  };
+  const client = await RoomClient.enter({ name: 'Ada', browser: players[0].browser, mode: 'relay', fetcher: fetcher('relay') });
+  assert.equal(client.mode, 'relay');
+  assert.equal(bodies[0].mode, 'relay');
+  await assert.rejects(() => RoomClient.enter({ name: 'Ada', browser: players[0].browser, mode: 'relay', fetcher: fetcher('webrtc') }),
+    /Refusing to connect directly/);
+  await assert.rejects(() => RoomClient.enter({ name: 'Ada', browser: players[0].browser, mode: 'relay', fetcher: fetcher(undefined) }),
+    /Refusing to connect directly/);
+  await assert.rejects(() => RoomClient.enter({ room: 'another-room-identifier', name: 'Ada', browser: players[0].browser, mode: 'relay', fetcher: fetcher('relay') }),
+    /invalid seat details/, 'the server must seat us at the invited table');
+  const wrong = await RoomClient.enter({ name: 'Ada', browser: players[0].browser, mode: 'relay',
+    fetcher: async () => response({ error: 'This table uses webrtc mode', code: 'wrong_mode' }, 400) }).catch(error => error);
+  assert.equal(wrong.code, 'wrong_mode');
+});
+
+test('relay events are validated, and each kind of table rejects the other kind of event', () => {
+  const relay = { type: 'relay', from: 1, seq: 2, payload: 'abc-_' };
+  assert.deepEqual(parseRoomEvent(JSON.stringify(relay), 0, 'relay'), relay);
+  assert.deepEqual(parseRoomEvent('{"type":"ping"}', 0, 'relay'), { type: 'ping' });
+  assert.throws(() => parseRoomEvent(JSON.stringify(relay), 0, 'webrtc'), /invalid event/);
+  assert.throws(() => parseRoomEvent(JSON.stringify({ type: 'signal', from: 1, signal: '{}' }), 0, 'relay'), /invalid event/);
+  for (const bad of [{ from: 0 }, { seq: 0 }, { seq: 1.5 }, { payload: 'a=' }, { payload: '' }, { payload: 'a'.repeat(87468) }]) {
+    assert.throws(() => parseRoomEvent(JSON.stringify({ ...relay, ...bad }), 0, 'relay'), /invalid event|too large/);
+  }
+});
+
+test('the relay event stream drops replays, resumes from the last id, and survives a dead stream', () => {
+  FakeEventSource.instances = [];
+  const timers = new FakeTimers();
+  const client = new RoomClient({ room: roomId, token, seat: 0, mode: 'relay' }, async () => response({}), FakeEventSource, timers);
+  let clock = 0;
+  client.now = () => clock;
+  const events = [];
+  const errors = [];
+  client.listen(event => events.push(event), error => errors.push(error.message));
+  const first = FakeEventSource.instances[0];
+  assert.doesNotMatch(first.url, /after=/);
+  const relay = seq => JSON.stringify({ type: 'relay', from: 1, seq, payload: 'AAAA' });
+  first.onmessage({ data: JSON.stringify({ type: 'players', players }), lastEventId: '' });
+  first.onmessage({ data: relay(1), lastEventId: '1' });
+  first.onmessage({ data: relay(2), lastEventId: '2' });
+  first.onmessage({ data: JSON.stringify({ type: 'players', players }), lastEventId: '2' }); // the id buffer persists
+  first.onmessage({ data: relay(2), lastEventId: '2' });
+  assert.deepEqual(events.map(event => event.type), ['players', 'relay', 'relay', 'players']);
+  assert.equal(client.lastEventId, 2);
+
+  clock = 20000;
+  first.listeners.ping();
+  timers.run();
+  assert.equal(FakeEventSource.instances.length, 1, 'pings keep the stream alive');
+  clock = 46000;
+  timers.run();
+  assert.equal(FakeEventSource.instances.length, 2, 'the watchdog reopens a silent stream');
+  assert.ok(first.closed);
+  const second = FakeEventSource.instances[1];
+  assert.match(second.url, /after=2$/);
+  second.onmessage({ data: relay(3), lastEventId: '3' });
+  assert.equal(events.length, 5);
+
+  second.readyState = 0;
+  second.onerror();
+  assert.equal(FakeEventSource.instances.length, 2, 'EventSource retries by itself while CONNECTING');
+  second.readyState = 2;
+  second.onerror();
+  timers.run();
+  assert.equal(FakeEventSource.instances.length, 3, 'a stream EventSource gave up on is reopened by hand');
+  assert.match(FakeEventSource.instances[2].url, /after=3$/);
+  clock += 151000;
+  timers.run();
+  assert.match(errors[0], /Lost contact/);
+  assert.ok(FakeEventSource.instances.at(-1).closed);
+  assert.equal(timers.tasks.size, 0, 'no timers left behind');
+});
+
+test('relay frames are posted with the seat token and an abort signal, and API errors are returned', async () => {
+  const requests = [];
+  const client = new RoomClient({ room: roomId, token, seat: 0, mode: 'relay' }, async (path, options) => {
+    requests.push({ path, options });
+    return response({ error: 'gap', code: 'gap', expected: { 1: 2 } }, 422);
+  }, FakeEventSource);
+  const controller = new AbortController();
+  const result = await client.sendFrames({ frames: [{ to: 1, seq: 3, payload: 'AAAA' }], ack: 4 }, controller.signal);
+  assert.deepEqual(result, { status: 422, data: { error: 'gap', code: 'gap', expected: { 1: 2 } } });
+  assert.equal(requests[0].path, `/api/rooms/${roomId}/relay`);
+  assert.equal(requests[0].options.headers.Authorization, `Bearer ${token}`);
+  assert.equal(requests[0].options.signal, controller.signal);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { frames: [{ to: 1, seq: 3, payload: 'AAAA' }], ack: 4 });
+});
