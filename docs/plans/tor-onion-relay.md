@@ -610,7 +610,23 @@ Target: OpenWrt 24.10 (`opkg`), `aarch64_cortex-a53`.
 5. Keep no hostnames or addresses in the repo.
 6. README section "Play over Tor" with the caveats below.
 
-#### Phase 5 status (2026-11-15): tooling written, not yet run on the router
+#### Phase 5 status (2026-11-15): deployed on the router
+
+**Deployed 2026-11-15.** `deploy-router.sh` ran cleanly on the first try:
+`tor-basic` 0.4.9.13 installed, user created, onion service up, and
+`p2skat-room` running relay-only (`--max-rooms 8 --max-connections 96`). The
+procd `service delete … Not found` message on a first install is harmless. The
+health check fell back to "421 means alive", which shows the router has no
+header-capable `wget` and no `nc`. `--check` on the router: live
+`StaticTests` OK, full suite 35 tests OK (13 skipped because they need special
+server config). Binary 777,352 bytes. Live server VmHWM 1.3 MB; the test
+instance after the full suite peaked at 1.5 MB. **Acceptance 6: PASS.** From a
+laptop Tor client, `/api/health` → 200 (13 s, first attempt while the
+descriptor was still publishing failed), `/` → 200 in 4 s with the CSP and
+security headers intact. Still open: acceptance 1, three real Tor Browsers on
+different networks playing two rounds.
+
+Tooling as written:
 
 - `scripts/deploy-router.sh <ssh-host>` (local, bash) builds or reuses the
   router binary and `web/pkg`, stages only the served files (html/css/js/mjs,
