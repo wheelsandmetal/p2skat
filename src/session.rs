@@ -42,7 +42,9 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::ops::Range;
 
-use crate::crypto::protocol::{encrypt_and_shuffle, verify_hand, CardCodec, DealPositions};
+use crate::crypto::protocol::{
+    encrypt_and_shuffle, in_card_group, verify_hand, CardCodec, DealPositions,
+};
 use crate::crypto::sra::SraKeyPair;
 use crate::game::bidding::{BidAction, BiddingState, Seat};
 use crate::game::card::Card;
@@ -366,13 +368,11 @@ impl<T: Transport> Session<T> {
                 self.send_to(1, &msg).await?;
 
                 // Wait for final deck from seat 2
-                let final_msg = self.recv_from_or_quit(2).await?;
-                Ok(message_to_deck(&final_msg, &self.prime)?)
+                self.recv_deck(2).await
             }
             1 => {
                 // Wait for deck from seat 0
-                let msg = self.recv_from_or_quit(0).await?;
-                let deck = message_to_deck(&msg, &self.prime)?;
+                let deck = self.recv_deck(0).await?;
 
                 // Encrypt and shuffle, send to seat 2
                 let shuffled = encrypt_and_shuffle(&deck, &self.key);
@@ -380,13 +380,11 @@ impl<T: Transport> Session<T> {
                 self.send_to(2, &msg).await?;
 
                 // Wait for final deck from seat 2
-                let final_msg = self.recv_from_or_quit(2).await?;
-                Ok(message_to_deck(&final_msg, &self.prime)?)
+                self.recv_deck(2).await
             }
             2 => {
                 // Wait for deck from seat 1
-                let msg = self.recv_from_or_quit(1).await?;
-                let deck = message_to_deck(&msg, &self.prime)?;
+                let deck = self.recv_deck(1).await?;
 
                 // Encrypt and shuffle
                 let shuffled = encrypt_and_shuffle(&deck, &self.key);
@@ -399,6 +397,33 @@ impl<T: Transport> Session<T> {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Receive a shuffled deck from `seat` and check every value before using it.
+    async fn recv_deck(&self, seat: usize) -> Result<Vec<BigUint>> {
+        let msg = self.recv_from_or_quit(seat).await?;
+        let deck = message_to_deck(&msg, &self.prime)?;
+        self.check_card_group(seat, &deck)?;
+        Ok(deck)
+    }
+
+    /// Every received deck value and partial decryption must be an honest-looking
+    /// encrypted card (see [`in_card_group`]), and no value may repeat: SRA layers
+    /// are bijections, so distinct cards stay distinct.
+    fn check_card_group(&self, seat: usize, values: &[BigUint]) -> Result<()> {
+        for (i, value) in values.iter().enumerate() {
+            anyhow::ensure!(
+                in_card_group(value, &self.prime),
+                "Cheating detected: {} sent a value outside the card group",
+                self.names[seat]
+            );
+            anyhow::ensure!(
+                !values[..i].contains(value),
+                "Cheating detected: {} sent the same encrypted card twice",
+                self.names[seat]
+            );
+        }
+        Ok(())
     }
 
     /// Deal phase, hops 3–5 of the schedule in the module docs. Returns this
@@ -475,6 +500,7 @@ impl<T: Transport> Session<T> {
     ) -> Result<Vec<BigUint>> {
         let msg = self.recv_from_or_quit(seat).await?;
         let values = extract_partial_decrypt(&msg, &indices, stripped, &self.prime)?;
+        self.check_card_group(seat, &values)?;
         self.round.borrow_mut().received.push(Received {
             from: seat,
             indices,
@@ -1277,9 +1303,16 @@ mod session_tests {
         }
     }
     fn sessions() -> [Session<MemoryTransport>; 3] {
+        sessions_with((BigUint::from(1u8) << 127usize) - BigUint::from(1u8))
+    }
+    /// 2^128 + 0x30a3 is a safe prime (like the real 2048-bit one) and ≡ 3 mod 4,
+    /// so -1 is a quadratic non-residue.
+    fn safe_prime() -> BigUint {
+        (BigUint::from(1u8) << 128usize) + BigUint::from(0x30a3u32)
+    }
+    fn sessions_with(prime: BigUint) -> [Session<MemoryTransport>; 3] {
         let channels: [_; 3] = std::array::from_fn(|_| mpsc::unbounded_channel());
         let senders = channels.each_ref().map(|(sender, _)| sender.clone());
-        let prime = (BigUint::from(1u8) << 127usize) - BigUint::from(1u8);
         let mut seat = 0;
         channels.map(|(_, receiver)| {
             let transport = MemoryTransport {
@@ -1487,6 +1520,82 @@ mod session_tests {
         );
         let error_c = results.2.unwrap_err().to_string();
         assert!(error_c.contains("Cheating detected"), "{error_c}");
+    }
+
+    #[tokio::test]
+    async fn a_sign_flipped_deck_value_is_rejected_at_once() {
+        let prime = safe_prime();
+        let [mut a, mut b, _c] = sessions_with(prime.clone());
+        // Seat 0 tags one card as -c: SRA keeps the Legendre symbol, so seat 0
+        // could follow that card through every later shuffle.
+        let tamper_prime = prime.clone();
+        *a.transport.tamper.borrow_mut() = Some(Box::new(move |_, message| {
+            if let Message::ShuffledDeck { cards } = message {
+                let value = BigUint::parse_bytes(cards[0].as_bytes(), 16).unwrap();
+                cards[0] = (&tamper_prime - value).to_str_radix(16);
+            }
+        }));
+        let error = timeout(async {
+            tokio::select! {
+                result = b.shuffle_phase() => result,
+                _ = a.shuffle_phase() => unreachable!("seat 0 waits for seat 2"),
+            }
+        })
+        .await
+        .expect("seat 1 decides without waiting")
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Cheating detected: Player 0 sent a value outside the card group"
+        );
+    }
+
+    #[tokio::test]
+    async fn partials_must_be_distinct_values_in_the_card_group() {
+        let prime = safe_prime();
+        let [_a, b, c] = sessions_with(prime.clone());
+        let codec = CardCodec::new(&prime).unwrap();
+        let hand0 = DealPositions::player_range(0);
+        let honest: Vec<BigUint> = codec.deck()[hand0.clone()]
+            .iter()
+            .map(|value| c.key.encrypt(value))
+            .collect();
+        let mut flipped = honest.clone();
+        flipped[3] = &prime - &flipped[3];
+        let mut one = honest.clone();
+        one[0] = BigUint::from(1u8);
+        let mut repeated = honest.clone();
+        repeated[9] = repeated[2].clone();
+        for (values, expected) in [
+            (flipped, "Player 2 sent a value outside the card group"),
+            (one, "Player 2 sent a value outside the card group"),
+            (repeated, "Player 2 sent the same encrypted card twice"),
+        ] {
+            c.send_partial(1, hand0.clone(), &[2], &values)
+                .await
+                .unwrap();
+            let error = b.recv_partial(2, hand0.clone(), &[2]).await.unwrap_err();
+            assert_eq!(error.to_string(), format!("Cheating detected: {expected}"));
+        }
+        c.send_partial(1, hand0.clone(), &[2], &honest)
+            .await
+            .unwrap();
+        assert_eq!(b.recv_partial(2, hand0, &[2]).await.unwrap(), honest);
+    }
+
+    #[tokio::test]
+    async fn rounds_complete_with_a_safe_prime() {
+        let [mut a, mut b, mut c] = sessions_with(safe_prime());
+        timeout(async {
+            tokio::try_join!(
+                deal_and_reveal(&mut a),
+                deal_and_reveal(&mut b),
+                deal_and_reveal(&mut c)
+            )
+        })
+        .await
+        .expect("round should complete")
+        .unwrap();
     }
 
     #[tokio::test]

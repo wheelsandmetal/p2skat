@@ -82,6 +82,46 @@ impl CardCodec {
     }
 }
 
+/// Jacobi symbol `(a/n)` for odd `n > 0`: 1, -1 (as `n - 1` would be awkward), or 0.
+/// For a prime `n` this is the Legendre symbol, computed without a modular exponentiation.
+pub fn jacobi(a: &BigUint, n: &BigUint) -> i8 {
+    debug_assert!(n.bit(0), "the Jacobi symbol needs an odd modulus");
+    let low = |value: &BigUint| value.iter_u32_digits().next().unwrap_or(0);
+    let mut a = a % n;
+    let mut n = n.clone();
+    let mut result = 1i8;
+    while a != BigUint::default() {
+        let zeros = a.trailing_zeros().unwrap_or(0);
+        a >>= zeros;
+        if zeros % 2 == 1 && matches!(low(&n) & 7, 3 | 5) {
+            result = -result;
+        }
+        std::mem::swap(&mut a, &mut n);
+        if low(&a) & 3 == 3 && low(&n) & 3 == 3 {
+            result = -result;
+        }
+        a %= &n;
+    }
+    if n == BigUint::from(1u8) {
+        result
+    } else {
+        0
+    }
+}
+
+/// True if `value` can be an honest encrypted or partially decrypted card.
+///
+/// Every card encoding is a quadratic residue other than 1, and SRA keys are odd
+/// exponents, so every layer added or removed keeps a value inside the residues
+/// and away from 1. A value outside them (for example `p - c`, a sign flip) would
+/// let its sender recognise that card through every later shuffle, so honest
+/// peers refuse it at once instead of at the key reveal. For the safe game prime
+/// the residues are the prime-order subgroup, which has no smaller subgroups to
+/// tag with.
+pub fn in_card_group(value: &BigUint, p: &BigUint) -> bool {
+    *value > BigUint::from(1u8) && value < p && jacobi(value, p) == 1
+}
+
 /// Verify that a final set of decrypted values encodes all 32 cards exactly once.
 /// Returns the decoded cards if valid, or an error description.
 pub fn verify_deck(decrypted_values: &[BigUint], codec: &CardCodec) -> Result<Vec<Card>, String> {
@@ -179,6 +219,60 @@ mod tests {
                 assert_eq!(codec.decode(codec.encode(*card)), Some(*card));
             }
             assert_eq!(codec.decode(&one), None);
+        }
+    }
+
+    #[test]
+    fn jacobi_matches_euler_and_card_group_survives_every_layer() {
+        let one = BigUint::from(1u8);
+        let mersenne = (BigUint::from(1u8) << 127usize) - &one;
+        let safe = (BigUint::from(1u8) << 128usize) + BigUint::from(0x30a3u32);
+        let mut rng = rand::thread_rng();
+        // The 2048-bit prime is slow in debug builds: few samples, no keys.
+        for (p, count) in [
+            (small_prime(), 50),
+            (BigUint::from(23u8), 50),
+            (mersenne, 50),
+            (safe, 50),
+            (shared_prime(), 4),
+        ] {
+            let exponent = (&p - &one) >> 1usize;
+            let samples = (1u32..=count * 4).map(BigUint::from).chain(
+                (0..count)
+                    .map(|_| BigUint::from_bytes_be(&rand::Rng::gen::<[u8; 32]>(&mut rng)) % &p),
+            );
+            for value in samples {
+                let euler = value.modpow(&exponent, &p);
+                let expected = if value.clone() % &p == BigUint::default() {
+                    0
+                } else if euler == one {
+                    1
+                } else {
+                    -1
+                };
+                assert_eq!(jacobi(&value, &p), expected, "({value}/{p})");
+            }
+            // Honest values stay in the group through encryption and decryption; a
+            // sign flip (p ≡ 3 mod 4 makes -1 a non-residue) and 1 never are.
+            let Ok(codec) = CardCodec::new(&p) else {
+                continue;
+            };
+            if count < 50 {
+                assert!(codec.deck().iter().all(|value| in_card_group(value, &p)));
+                continue;
+            }
+            let key = SraKeyPair::generate(&p);
+            for value in codec.deck().iter().take(8) {
+                let encrypted = key.encrypt(value);
+                assert!(in_card_group(value, &p) && in_card_group(&encrypted, &p));
+                assert!(in_card_group(&key.decrypt(value), &p));
+                if p.bit(1) {
+                    assert!(!in_card_group(&(&p - &encrypted), &p));
+                }
+            }
+            assert!(!in_card_group(&one, &p));
+            assert!(!in_card_group(&BigUint::default(), &p));
+            assert!(!in_card_group(&p, &p));
         }
     }
 
