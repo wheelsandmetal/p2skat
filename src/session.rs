@@ -1,9 +1,48 @@
 //! Shared game flow for terminal and browser frontends.
+//!
+//! # Deal (5 sequential hops)
+//!
+//! Keys A, B, C belong to seats 0, 1, 2. `F` is the final deck, `H0`, `H1`,
+//! `H2` its hand positions. SRA layers commute, so hands are dealt in parallel
+//! and layers are stripped in a chain helper → helper → owner:
+//!
+//! 1. 0 → 1: deck encrypted and shuffled by A.
+//! 2. 1 → 2: deck encrypted and shuffled by B.
+//! 3. 2 → 0, 1: `F` (encrypted and shuffled by C). Also 2 → 1: `C⁻¹(H0)`,
+//!    2 → 0: `C⁻¹(H1)`.
+//! 4. 1 → 0: `B⁻¹C⁻¹(H0)`; 0 opens hand 0. 0 → 1: `A⁻¹(H2)` taken from `F`,
+//!    then `A⁻¹C⁻¹(H1)`; 1 opens hand 1. Seats 0 and 1 both send before they
+//!    receive, so this concurrent exchange cannot deadlock.
+//! 5. 1 → 2: `B⁻¹A⁻¹(H2)`; 2 opens hand 2.
+//!
+//! The skat stays triply encrypted. Hand 2 cannot finish sooner: `F` exists
+//! only after hop 2, and two other layers must then come off in sequence.
+//!
+//! # Skat pickup (2 hops after the request)
+//!
+//! Right after bidding, the first helper `(d+1)%3` strips its layer from the
+//! skat positions of its own copy of `F` and sends them to the second helper
+//! `(d+2)%3`. If the declarer `d` picks up, it broadcasts `SkatRequest` (no
+//! ciphertexts); the second helper strips its layer and sends the result to
+//! `d`, who opens the skat.
+//!
+//! # Decryption oracle
+//!
+//! No helper ever decrypts ciphertexts chosen by the player who receives the
+//! result. A helper either takes its input from fixed positions of its own
+//! copy of `F`, or strips a vector received from another helper and passes the
+//! result on to a third player. Every received partial decryption is recorded
+//! and recomputed from the revealed keys in `reveal_phase`; a mismatch is
+//! reported as cheating. Those checks also catch seat 2 sending seats 0 and 1
+//! different final decks: the hand vectors pass between 0 and 1, so their two
+//! copies must agree on positions 0..30, and since both decrypt to a full deck
+//! the two skat ciphertexts are then the same pair.
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::ops::Range;
 
-use crate::crypto::protocol::{card_values, encrypt_and_shuffle, verify_hand, DealPositions};
+use crate::crypto::protocol::{encrypt_and_shuffle, verify_hand, CardCodec, DealPositions};
 use crate::crypto::sra::SraKeyPair;
 use crate::game::bidding::{BidAction, BiddingState, Seat};
 use crate::game::card::Card;
@@ -11,7 +50,7 @@ use crate::game::contract::{Contract, GameType, Modifiers};
 use crate::game::scoring::{count_points, game_value, null_value, ScoreBoard};
 use crate::game::state::{GameState, Phase};
 use crate::game::trick::{legal_plays, Trick};
-use crate::net::message::Message;
+use crate::net::message::{protocol_mismatch, Message, PROTOCOL_VERSION};
 use anyhow::Result;
 use num_bigint::BigUint;
 
@@ -85,7 +124,27 @@ pub struct Session<T> {
     pub key: SraKeyPair,
     pub prime: BigUint,
     pub transport: T,
+    codec: CardCodec,
     pending: RefCell<VecDeque<(usize, Message)>>,
+    round: RefCell<RoundRecord>,
+}
+
+/// What this player received and opened during one round, kept until the keys
+/// are revealed so every step can be recomputed and checked.
+#[derive(Default)]
+struct RoundRecord {
+    received: Vec<Received>,
+    /// Cards this player decrypted, with their final-deck positions.
+    opened: Vec<(usize, Card)>,
+}
+
+/// A partial decryption received from `from`: final-deck `indices` with the
+/// layers of the `stripped` seats removed.
+struct Received {
+    from: usize,
+    indices: Range<usize>,
+    stripped: Vec<usize>,
+    values: Vec<BigUint>,
 }
 
 impl<T: Transport> Session<T> {
@@ -98,10 +157,8 @@ impl<T: Transport> Session<T> {
         transport: T,
     ) -> Result<Self> {
         anyhow::ensure!(my_seat < 3, "Invalid local seat");
-        anyhow::ensure!(
-            prime > BigUint::from(32u8) && key.p == prime,
-            "Invalid game prime"
-        );
+        anyhow::ensure!(key.p == prime, "Invalid game prime");
+        let codec = CardCodec::new(&prime).map_err(anyhow::Error::msg)?;
         Ok(Self {
             my_seat,
             my_name,
@@ -109,7 +166,9 @@ impl<T: Transport> Session<T> {
             key,
             prime,
             transport,
+            codec,
             pending: RefCell::new(VecDeque::new()),
+            round: RefCell::new(RoundRecord::default()),
         })
     }
 
@@ -182,7 +241,25 @@ impl<T: Transport> Session<T> {
         }
         result
     }
+    /// Every transport starts here, so mismatched builds fail before dealing.
+    async fn check_protocol(&self) -> Result<()> {
+        self.broadcast(&Message::Protocol {
+            version: PROTOCOL_VERSION,
+        })
+        .await?;
+        for seat in (0..3).filter(|seat| *seat != self.my_seat) {
+            match self.recv_from_or_quit(seat).await? {
+                Message::Protocol { version } if version == PROTOCOL_VERSION => {}
+                Message::Protocol { version } => {
+                    anyhow::bail!(protocol_mismatch(&self.names[seat], version))
+                }
+                _ => anyhow::bail!(protocol_mismatch(&self.names[seat], 0)),
+            }
+        }
+        Ok(())
+    }
     async fn run_game_inner(&mut self, ui: &mut impl Frontend) -> Result<()> {
+        self.check_protocol().await?;
         let mut state = GameState::new(Seat::from_index(self.my_seat));
 
         state.phase = Phase::Shuffling;
@@ -278,8 +355,8 @@ impl<T: Transport> Session<T> {
     async fn shuffle_phase(&mut self) -> Result<Vec<BigUint>> {
         // Previous rounds reveal their keys, so every new deck needs a fresh pair.
         self.key = SraKeyPair::generate(&self.prime);
-        let values = card_values();
-        let initial: Vec<BigUint> = values.into_iter().collect();
+        *self.round.borrow_mut() = RoundRecord::default();
+        let initial = self.codec.deck();
 
         match self.my_seat {
             0 => {
@@ -324,101 +401,187 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// Deal phase: decrypt cards for each player via sequential decryption.
-    async fn deal_phase(&self, encrypted_deck: &[BigUint]) -> Result<Vec<Card>> {
-        let my_seat = self.my_seat;
-        anyhow::ensure!(encrypted_deck.len() == 32, "Expected 32 encrypted cards");
-
-        // For each player's hand, the other two players need to remove their encryption layers.
-        // Then the owner removes theirs to get plaintext.
-
-        let mut my_cards = Vec::new();
-
-        for target_player in 0..3 {
-            let indices = DealPositions::player_indices(target_player);
-            let target_encrypted: Vec<BigUint> =
-                indices.iter().map(|&i| encrypted_deck[i].clone()).collect();
-
-            if target_player == my_seat {
-                // I need others to decrypt for me.
-                // The two non-me players decrypt sequentially.
-                let others: Vec<usize> = (0..3).filter(|&s| s != my_seat).collect();
-
-                // Send my encrypted cards to first other player for partial decrypt.
-                let msg = Message::PartialDecrypt {
-                    target: my_seat,
-                    cards: biguints_to_hex(&target_encrypted),
-                    indices: indices.clone(),
-                };
-                self.send_to(others[0], &msg).await?;
-
-                // Receive partially decrypted from first other.
-                let resp = self.recv_from_or_quit(others[0]).await?;
-                let partial1 = extract_partial_decrypt(&resp, self.my_seat, &indices, &self.prime)?;
-
-                // Send to second other for their layer.
-                let msg = Message::PartialDecrypt {
-                    target: my_seat,
-                    cards: biguints_to_hex(&partial1),
-                    indices: indices.clone(),
-                };
-                self.send_to(others[1], &msg).await?;
-
-                // Receive from second other.
-                let resp = self.recv_from_or_quit(others[1]).await?;
-                let partial2 = extract_partial_decrypt(&resp, self.my_seat, &indices, &self.prime)?;
-
-                // Remove my own layer.
-                let plaintext: Vec<BigUint> =
-                    partial2.iter().map(|c| self.key.decrypt(c)).collect();
-
-                // Convert to cards.
-                for val in &plaintext {
-                    let idx: u64 = val
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Invalid card value: {}", val))?;
-                    let card = Card::from_index(idx)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid card index: {}", idx))?;
-                    my_cards.push(card);
-                }
-            } else {
-                // Another player needs decryption. Wait for request, decrypt, forward.
-                let msg = self.recv_from_or_quit(target_player).await?;
-
-                if let Message::PartialDecrypt {
-                    target,
-                    cards,
-                    indices: requested,
-                } = msg
-                {
-                    anyhow::ensure!(
-                        target == target_player && requested == indices,
-                        "Unexpected decryption target or indices"
-                    );
-                    let encrypted = hex_to_biguints(&cards, &self.prime)?;
-                    anyhow::ensure!(
-                        encrypted.len() == indices.len(),
-                        "Invalid decryption card count"
-                    );
-                    let decrypted: Vec<BigUint> =
-                        encrypted.iter().map(|c| self.key.decrypt(c)).collect();
-
-                    // If target is asking us, send back.
-                    let resp = Message::PartialDecrypt {
-                        target: target_player,
-                        cards: biguints_to_hex(&decrypted),
-                        indices: indices.clone(),
-                    };
-                    self.send_to(target_player, &resp).await?;
-                } else {
-                    anyhow::bail!("Expected PartialDecrypt from seat {}", target_player);
-                }
+    /// Deal phase, hops 3–5 of the schedule in the module docs. Returns this
+    /// player's hand in deck-position order.
+    async fn deal_phase(&self, deck: &[BigUint]) -> Result<Vec<Card>> {
+        anyhow::ensure!(deck.len() == 32, "Expected 32 encrypted cards");
+        let hand = DealPositions::player_range;
+        let own = match self.my_seat {
+            0 => {
+                // Hop 4. Hand 2 starts its chain here, straight from the deck.
+                self.send_partial(1, hand(2), &[0], &self.strip(&deck[hand(2)]))
+                    .await?;
+                let hand1 = self.recv_partial(2, hand(1), &[2]).await?;
+                self.send_partial(1, hand(1), &[2, 0], &self.strip(&hand1))
+                    .await?;
+                self.recv_partial(1, hand(0), &[2, 1]).await?
             }
-        }
+            1 => {
+                // Hop 4: finish hand 0 for seat 0.
+                let hand0 = self.recv_partial(2, hand(0), &[2]).await?;
+                self.send_partial(0, hand(0), &[2, 1], &self.strip(&hand0))
+                    .await?;
+                // Hop 5: finish hand 2 for seat 2.
+                let hand2 = self.recv_partial(0, hand(2), &[0]).await?;
+                self.send_partial(2, hand(2), &[0, 1], &self.strip(&hand2))
+                    .await?;
+                self.recv_partial(0, hand(1), &[2, 0]).await?
+            }
+            2 => {
+                // Hop 3, right behind the final deck.
+                self.send_partial(1, hand(0), &[2], &self.strip(&deck[hand(0)]))
+                    .await?;
+                self.send_partial(0, hand(1), &[2], &self.strip(&deck[hand(1)]))
+                    .await?;
+                self.recv_partial(1, hand(2), &[0, 1]).await?
+            }
+            _ => unreachable!(),
+        };
+        self.open_cards(hand(self.my_seat), &own)
+    }
 
-        anyhow::ensure!(my_cards.len() == 10, "Expected ten cards in hand");
-        ensure_unique_cards(&my_cards)?;
-        Ok(my_cards)
+    /// Remove this player's layer.
+    fn strip(&self, values: &[BigUint]) -> Vec<BigUint> {
+        values.iter().map(|value| self.key.decrypt(value)).collect()
+    }
+
+    async fn send_partial(
+        &self,
+        seat: usize,
+        indices: Range<usize>,
+        stripped: &[usize],
+        values: &[BigUint],
+    ) -> Result<()> {
+        debug_assert_eq!(stripped.last(), Some(&self.my_seat));
+        debug_assert_eq!(indices.len(), values.len());
+        self.send_to(
+            seat,
+            &Message::PartialDecrypt {
+                indices: indices.collect(),
+                stripped: stripped.to_vec(),
+                cards: biguints_to_hex(values),
+            },
+        )
+        .await
+    }
+
+    /// Receive the one partial decryption expected from `seat` at this step and
+    /// record it for the check after the key reveal.
+    async fn recv_partial(
+        &self,
+        seat: usize,
+        indices: Range<usize>,
+        stripped: &[usize],
+    ) -> Result<Vec<BigUint>> {
+        let msg = self.recv_from_or_quit(seat).await?;
+        let values = extract_partial_decrypt(&msg, &indices, stripped, &self.prime)?;
+        self.round.borrow_mut().received.push(Received {
+            from: seat,
+            indices,
+            stripped: stripped.to_vec(),
+            values: values.clone(),
+        });
+        Ok(values)
+    }
+
+    /// Remove the last layer (mine) and decode; remembers what was opened.
+    fn open_cards(&self, indices: Range<usize>, values: &[BigUint]) -> Result<Vec<Card>> {
+        let cards = self
+            .strip(values)
+            .iter()
+            .map(|value| {
+                self.codec
+                    .decode(value)
+                    .ok_or_else(|| anyhow::anyhow!("Decrypted value is not a card"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure_unique_cards(&cards)?;
+        self.round
+            .borrow_mut()
+            .opened
+            .extend(indices.zip(cards.iter().copied()));
+        Ok(cards)
+    }
+
+    /// Skat helpers for declarer `d`: the first strips its layer before the
+    /// declarer decides, the second finishes on request.
+    fn skat_helpers(declarer: usize) -> (usize, usize) {
+        ((declarer + 1) % 3, (declarer + 2) % 3)
+    }
+
+    /// Run by every player right after bidding. The second helper returns the
+    /// skat with the first helper's layer removed.
+    async fn prepare_skat(
+        &self,
+        declarer: usize,
+        deck: &[BigUint],
+    ) -> Result<Option<Vec<BigUint>>> {
+        let (first, second) = Self::skat_helpers(declarer);
+        let skat = DealPositions::skat_range();
+        if self.my_seat == first {
+            self.send_partial(second, skat.clone(), &[first], &self.strip(&deck[skat]))
+                .await?;
+        } else if self.my_seat == second {
+            return Ok(Some(self.recv_partial(first, skat, &[first]).await?));
+        }
+        Ok(None)
+    }
+
+    /// Declarer: request the skat and open it (2 hops).
+    async fn pick_up_skat(&self) -> Result<Vec<Card>> {
+        self.broadcast(&Message::SkatRequest).await?;
+        let (first, second) = Self::skat_helpers(self.my_seat);
+        let skat = DealPositions::skat_range();
+        let values = self
+            .recv_partial(second, skat.clone(), &[first, second])
+            .await?;
+        self.open_cards(skat, &values)
+    }
+
+    /// Second helper, on `SkatRequest`: strip my layer and send to the declarer.
+    async fn release_skat(&self, declarer: usize, prepared: Option<&[BigUint]>) -> Result<()> {
+        if let Some(values) = prepared {
+            let (first, second) = Self::skat_helpers(declarer);
+            self.send_partial(
+                declarer,
+                DealPositions::skat_range(),
+                &[first, second],
+                &self.strip(values),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Recompute every received partial decryption and every opened card from
+    /// the revealed keys.
+    fn verify_round(&self, deck: &[BigUint], keys: &[SraKeyPair], revealed: &[Card]) -> Result<()> {
+        let round = self.round.borrow();
+        for received in &round.received {
+            let mut expected = deck[received.indices.clone()].to_vec();
+            for &seat in &received.stripped {
+                expected = expected
+                    .iter()
+                    .map(|value| keys[seat].decrypt(value))
+                    .collect();
+            }
+            anyhow::ensure!(
+                expected == received.values,
+                "Cheating detected: {} sent a partial decryption of deck positions {:?} \
+                 that does not match the revealed keys",
+                self.names[received.from],
+                received.indices
+            );
+        }
+        for &(position, card) in &round.opened {
+            anyhow::ensure!(
+                revealed[position] == card,
+                "Cheating detected: the card dealt to you at deck position {} differs \
+                 from the revealed deck",
+                position
+            );
+        }
+        Ok(())
     }
 
     /// Bidding phase using the terminal UI.
@@ -496,52 +659,7 @@ impl<T: Transport> Session<T> {
             let pick_up = self.input(ui.ask_skat_pickup(&state.hand)).await?;
 
             if pick_up {
-                // Request skat decryption from others.
-                self.broadcast(&Message::SkatRequest).await?;
-
-                // Decrypt skat cards (same process as dealing).
-                let skat_indices = DealPositions::skat_indices();
-                let skat_encrypted: Vec<BigUint> = skat_indices
-                    .iter()
-                    .map(|&i| state.encrypted_deck[i].clone())
-                    .collect();
-
-                let others: Vec<usize> = (0..3).filter(|&s| s != self.my_seat).collect();
-
-                // Ask first other to decrypt
-                let msg = Message::PartialDecrypt {
-                    target: self.my_seat,
-                    cards: biguints_to_hex(&skat_encrypted),
-                    indices: skat_indices.clone(),
-                };
-                self.send_to(others[0], &msg).await?;
-                let resp = self.recv_from_or_quit(others[0]).await?;
-                let partial1 =
-                    extract_partial_decrypt(&resp, self.my_seat, &skat_indices, &self.prime)?;
-
-                // Ask second other to decrypt
-                let msg = Message::PartialDecrypt {
-                    target: self.my_seat,
-                    cards: biguints_to_hex(&partial1),
-                    indices: skat_indices.clone(),
-                };
-                self.send_to(others[1], &msg).await?;
-                let resp = self.recv_from_or_quit(others[1]).await?;
-                let partial2 =
-                    extract_partial_decrypt(&resp, self.my_seat, &skat_indices, &self.prime)?;
-
-                // Remove my layer
-                let skat_plain: Vec<BigUint> =
-                    partial2.iter().map(|c| self.key.decrypt(c)).collect();
-
-                let mut skat_cards = Vec::new();
-                for val in &skat_plain {
-                    let idx: u64 = val.try_into()?;
-                    skat_cards.push(
-                        Card::from_index(idx)
-                            .ok_or_else(|| anyhow::anyhow!("Invalid skat card index"))?,
-                    );
-                }
+                let skat_cards = self.pick_up_skat().await?;
 
                 // Add skat to hand
                 state.hand.extend(&skat_cards);
@@ -603,6 +721,10 @@ impl<T: Transport> Session<T> {
                 Ok(contract)
             }
         } else {
+            // Strip the first layer now, while the declarer decides.
+            let prepared = self
+                .prepare_skat(declarer.index(), &state.encrypted_deck)
+                .await?;
             // Wait for declarer's actions.
             // Might get SkatRequest or Declaration.
             let mut picked_up = false;
@@ -612,31 +734,8 @@ impl<T: Transport> Session<T> {
                     Message::SkatRequest => {
                         anyhow::ensure!(!picked_up, "Duplicate skat request");
                         picked_up = true;
-                        let decrypt_msg = self.recv_from_or_quit(declarer.index()).await?;
-                        if let Message::PartialDecrypt {
-                            target,
-                            cards,
-                            indices,
-                        } = decrypt_msg
-                        {
-                            anyhow::ensure!(
-                                target == declarer.index()
-                                    && indices == DealPositions::skat_indices(),
-                                "Invalid skat decryption request"
-                            );
-                            let encrypted = hex_to_biguints(&cards, &self.prime)?;
-                            anyhow::ensure!(encrypted.len() == 2, "Expected two skat cards");
-                            let decrypted: Vec<BigUint> =
-                                encrypted.iter().map(|c| self.key.decrypt(c)).collect();
-                            let resp = Message::PartialDecrypt {
-                                target,
-                                cards: biguints_to_hex(&decrypted),
-                                indices,
-                            };
-                            self.send_to(target, &resp).await?;
-                        } else {
-                            anyhow::bail!("Expected skat decryption request");
-                        }
+                        self.release_skat(declarer.index(), prepared.as_deref())
+                            .await?;
                     }
                     Message::Declaration {
                         game_type,
@@ -797,6 +896,7 @@ impl<T: Transport> Session<T> {
             [&key_pairs[0], &key_pairs[1], &key_pairs[2]],
         )
         .map_err(|e| anyhow::anyhow!("Verification failed: {}", e))?;
+        self.verify_round(encrypted_deck, &key_pairs, &cards)?;
         Ok(cards)
     }
 }
@@ -931,19 +1031,26 @@ fn hex_to_biguints(hex: &[String], prime: &BigUint) -> Result<Vec<BigUint>> {
 
 fn extract_partial_decrypt(
     msg: &Message,
-    seat: usize,
-    expected: &[usize],
+    expected_indices: &Range<usize>,
+    expected_stripped: &[usize],
     prime: &BigUint,
 ) -> Result<Vec<BigUint>> {
     match msg {
         Message::PartialDecrypt {
-            target,
-            cards,
             indices,
+            stripped,
+            cards,
         } => {
             anyhow::ensure!(
-                *target == seat && indices == expected && cards.len() == expected.len(),
-                "Invalid partial decryption response"
+                indices.iter().copied().eq(expected_indices.clone())
+                    && stripped == expected_stripped
+                    && cards.len() == expected_indices.len(),
+                "Unexpected partial decryption: positions {:?} without layers {:?}, \
+                 expected positions {:?} without layers {:?}",
+                indices,
+                stripped,
+                expected_indices,
+                expected_stripped
             );
             hex_to_biguints(cards, prime)
         }
@@ -1129,27 +1236,44 @@ mod scoring_tests {
 mod session_tests {
     use super::*;
     use crate::net::message::{BidActionMsg, CardMsg};
+    use std::cell::Cell;
     use tokio::sync::{mpsc, Mutex};
+
+    type Tamper = Box<dyn FnMut(usize, &mut Message)>;
+    /// (sender, message, hop depth)
+    type Envelope = (usize, Message, u32);
 
     struct MemoryTransport {
         seat: usize,
-        senders: [mpsc::UnboundedSender<(usize, Message)>; 3],
-        receiver: Mutex<mpsc::UnboundedReceiver<(usize, Message)>>,
+        senders: [mpsc::UnboundedSender<Envelope>; 3],
+        receiver: Mutex<mpsc::UnboundedReceiver<Envelope>>,
         sent: RefCell<Vec<Message>>,
+        /// Sequential hops so far: a message's depth is one more than the
+        /// deepest message its sender had received when sending it.
+        hops: Cell<u32>,
+        /// Lets a test play a cheating peer by rewriting outgoing messages.
+        tamper: RefCell<Option<Tamper>>,
     }
     impl Transport for MemoryTransport {
         async fn send_to(&self, seat: usize, message: &Message) -> Result<()> {
+            let mut message = message.clone();
+            if let Some(tamper) = self.tamper.borrow_mut().as_mut() {
+                tamper(seat, &mut message);
+            }
             self.sent.borrow_mut().push(message.clone());
-            self.senders[seat].send((self.seat, message.clone()))?;
+            self.senders[seat].send((self.seat, message, self.hops.get() + 1))?;
             Ok(())
         }
         async fn recv_any(&self) -> Result<(usize, Message)> {
-            self.receiver
+            let (seat, message, depth) = self
+                .receiver
                 .lock()
                 .await
                 .recv()
                 .await
-                .ok_or_else(|| anyhow::anyhow!("Disconnected"))
+                .ok_or_else(|| anyhow::anyhow!("Disconnected"))?;
+            self.hops.set(self.hops.get().max(depth));
+            Ok((seat, message))
         }
     }
     fn sessions() -> [Session<MemoryTransport>; 3] {
@@ -1163,6 +1287,8 @@ mod session_tests {
                 senders: senders.clone(),
                 receiver: Mutex::new(receiver),
                 sent: RefCell::new(Vec::new()),
+                hops: Cell::new(0),
+                tamper: RefCell::new(None),
             };
             let game = Session::new(
                 seat,
@@ -1273,6 +1399,206 @@ mod session_tests {
             previous_keys = Some([a.key.clone(), b.key.clone(), c.key.clone()]);
         }
     }
+
+    async fn deal(session: &mut Session<MemoryTransport>) -> Result<(Vec<BigUint>, Vec<Card>)> {
+        let deck = session.shuffle_phase().await?;
+        let hand = session.deal_phase(&deck).await?;
+        Ok((deck, hand))
+    }
+    fn hop_counts(games: [&Session<MemoryTransport>; 3]) -> [u32; 3] {
+        games.map(|game| game.transport.hops.get())
+    }
+    fn reset_hops(games: [&Session<MemoryTransport>; 3]) {
+        for game in games {
+            game.transport.hops.set(0);
+        }
+    }
+    fn timeout<F: Future>(future: F) -> tokio::time::Timeout<F> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), future)
+    }
+
+    #[tokio::test]
+    async fn deal_takes_five_hops_and_gives_disjoint_hands() {
+        let [mut a, mut b, mut c] = sessions();
+        let (deal_a, deal_b, deal_c) =
+            timeout(async { tokio::try_join!(deal(&mut a), deal(&mut b), deal(&mut c)) })
+                .await
+                .expect("deal should complete")
+                .unwrap();
+        // Seats 0 and 1 hold their hands after hop 4 (the in-memory clock may
+        // count a buffered hop-4 message early), seat 2 after hop 5.
+        let hops = hop_counts([&a, &b, &c]);
+        assert_eq!(hops.iter().max(), Some(&5), "{hops:?}");
+        assert_eq!(hops[2], 5, "{hops:?}");
+
+        assert_eq!(deal_a.0, deal_b.0);
+        assert_eq!(deal_a.0, deal_c.0);
+        let decoded = verify_hand(&deal_a.0, [&a.key, &b.key, &c.key]).unwrap();
+        let hands = [&deal_a.1, &deal_b.1, &deal_c.1];
+        let mut all: Vec<Card> = decoded[DealPositions::skat_range()].to_vec();
+        for (seat, hand) in hands.iter().enumerate() {
+            assert_eq!(hand.len(), 10);
+            assert_eq!(**hand, decoded[DealPositions::player_range(seat)]);
+            all.extend(hand.iter());
+        }
+        ensure_unique_cards(&all).unwrap();
+        assert_eq!(all.len(), 32);
+
+        // Every partial decryption a player received passes the reveal check.
+        let reveal = timeout(async {
+            tokio::try_join!(
+                a.reveal_phase(&deal_a.0),
+                b.reveal_phase(&deal_b.0),
+                c.reveal_phase(&deal_c.0)
+            )
+        });
+        reveal.await.unwrap().unwrap();
+        assert_eq!(a.round.borrow().received.len(), 2);
+        assert_eq!(b.round.borrow().received.len(), 3);
+        assert_eq!(c.round.borrow().received.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reveal_detects_a_tampered_partial_decryption() {
+        let [mut a, mut b, mut c] = sessions();
+        // Seat 0 cheats on the hand-2 vector it passes to seat 1 (hop 4): it
+        // swaps two values, so seat 2 still gets a plausible hand.
+        *a.transport.tamper.borrow_mut() = Some(Box::new(|seat, message| {
+            if let Message::PartialDecrypt { indices, cards, .. } = message {
+                if seat == 1 && indices[0] == 20 {
+                    cards.swap(0, 1);
+                }
+            }
+        }));
+        let results = timeout(async {
+            tokio::join!(
+                deal_and_reveal(&mut a),
+                deal_and_reveal(&mut b),
+                deal_and_reveal(&mut c)
+            )
+        })
+        .await
+        .expect("round should complete");
+        assert!(results.0.is_ok(), "the cheater's own checks pass");
+        let error_b = results.1.unwrap_err().to_string();
+        assert!(
+            error_b.contains("Cheating detected: Player 0") && error_b.contains("20..30"),
+            "{error_b}"
+        );
+        let error_c = results.2.unwrap_err().to_string();
+        assert!(error_c.contains("Cheating detected"), "{error_c}");
+    }
+
+    #[tokio::test]
+    async fn helpers_reject_a_partial_for_other_positions_or_layers() {
+        let [game, peer, _] = sessions();
+        // A peer cannot get a hand-0 helper step applied to the skat.
+        peer.send_partial(
+            0,
+            DealPositions::skat_range(),
+            &[1],
+            &vec![BigUint::from(5u8); 2],
+        )
+        .await
+        .unwrap();
+        let error = game
+            .recv_partial(1, DealPositions::player_range(0), &[2, 1])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Unexpected partial decryption"));
+    }
+
+    #[tokio::test]
+    async fn skat_pickup_takes_two_hops_and_is_checked_at_reveal() {
+        let [mut a, mut b, mut c] = sessions();
+        let (deal_a, deal_b, deal_c) =
+            timeout(async { tokio::try_join!(deal(&mut a), deal(&mut b), deal(&mut c)) })
+                .await
+                .unwrap()
+                .unwrap();
+        let deck = deal_a.0.clone();
+        reset_hops([&a, &b, &c]);
+
+        // Seat 1 declares: seat 2 strips first, seat 0 finishes.
+        let declarer = async { b.pick_up_skat().await };
+        let first_helper = async {
+            assert!(c.prepare_skat(1, &deal_c.0).await?.is_none());
+            anyhow::ensure!(matches!(
+                c.recv_from_or_quit(1).await?,
+                Message::SkatRequest
+            ));
+            Ok(())
+        };
+        let second_helper = async {
+            let prepared = a.prepare_skat(1, &deal_a.0).await?;
+            anyhow::ensure!(matches!(
+                a.recv_from_or_quit(1).await?,
+                Message::SkatRequest
+            ));
+            a.release_skat(1, prepared.as_deref()).await
+        };
+        let (skat, _, _) =
+            timeout(async { tokio::try_join!(declarer, first_helper, second_helper) })
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(b.transport.hops.get(), 2);
+        let decoded = verify_hand(&deck, [&a.key, &b.key, &c.key]).unwrap();
+        assert_eq!(skat, decoded[DealPositions::skat_range()]);
+
+        let reveal = timeout(async {
+            tokio::try_join!(
+                a.reveal_phase(&deal_a.0),
+                b.reveal_phase(&deal_b.0),
+                c.reveal_phase(&deal_c.0)
+            )
+        });
+        reveal.await.unwrap().unwrap();
+        // Seat 0 checks seat 2's step; seat 1 checks the result it opened.
+        assert_eq!(a.round.borrow().received.len(), 3);
+        assert_eq!(b.round.borrow().received.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn mismatched_protocol_versions_fail_clearly() {
+        let [game, old, newer] = sessions();
+        // Seat 1 runs a build from before versioning and starts dealing.
+        old.send_to(0, &Message::ShuffledDeck { cards: vec![] })
+            .await
+            .unwrap();
+        newer
+            .send_to(
+                0,
+                &Message::Protocol {
+                    version: PROTOCOL_VERSION + 1,
+                },
+            )
+            .await
+            .unwrap();
+        let error = game.check_protocol().await.unwrap_err().to_string();
+        assert!(error.contains("Player 1 runs an older p2skat"), "{error}");
+
+        let [game, peer, other] = sessions();
+        let current = Message::Protocol {
+            version: PROTOCOL_VERSION,
+        };
+        peer.send_to(0, &current).await.unwrap();
+        other
+            .send_to(
+                0,
+                &Message::Protocol {
+                    version: PROTOCOL_VERSION + 1,
+                },
+            )
+            .await
+            .unwrap();
+        let error = game.check_protocol().await.unwrap_err().to_string();
+        assert!(
+            error.contains("Player 2 runs p2skat protocol v3"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn three_players_complete_pickup_and_hand_rounds_with_fresh_keys() {
         let [mut a, mut b, mut c] = sessions();
@@ -1401,10 +1727,18 @@ mod session_tests {
         )
         .is_err());
         let partial = Message::PartialDecrypt {
-            target: 0,
-            cards: vec!["1".into()],
             indices: vec![32],
+            stripped: vec![1],
+            cards: vec!["1".into()],
         };
-        assert!(extract_partial_decrypt(&partial, 0, &[0], &prime).is_err());
+        assert!(extract_partial_decrypt(&partial, &(0..1), &[1], &prime).is_err());
+        let partial = Message::PartialDecrypt {
+            indices: vec![0],
+            stripped: vec![2],
+            cards: vec!["1".into()],
+        };
+        assert!(extract_partial_decrypt(&partial, &(0..1), &[1], &prime).is_err());
+        assert!(extract_partial_decrypt(&partial, &(0..2), &[2], &prime).is_err());
+        assert!(extract_partial_decrypt(&partial, &(0..1), &[2], &prime).is_ok());
     }
 }

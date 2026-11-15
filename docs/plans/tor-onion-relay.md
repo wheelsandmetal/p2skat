@@ -558,6 +558,11 @@ own ciphertexts), under one protocol version bump. It isn't a blocker for
 this plan: the relay works with either deal, and Phase 4 timings just need
 re-measuring after it lands.
 
+**Status: done (protocol v2).** Deal is 5 hops (seats 0 and 1 hold their
+hands after hop 4), skat pickup 2 hops after the request, both asserted by
+tests in `src/session.rs`. Schedule and oracle argument are in the
+`src/session.rs` module docs.
+
 ## Separate issue found during review (not part of this plan)
 
 Card plaintexts are raw indices 1..32 (`src/crypto/protocol.rs`
@@ -566,6 +571,10 @@ quadratic residue mod p, so every player learns that one bit of each
 encrypted card. The standard fix is to map cards to quadratic residues (e.g.
 encode card `i` as the i-th QR, or square each value). Track it separately. It
 affects all transports.
+
+**Status: done (protocol v2).** Squaring small values would keep SRA's
+multiplicative relations (`E(2²)² = E(4²)`), so cards are squares of
+hash-derived values mod p (`CardCodec` in `src/crypto/protocol.rs`).
 
 ## Out of scope
 

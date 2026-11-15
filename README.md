@@ -63,11 +63,18 @@ screenshots when credentials are present.
 Game processing and private keys stay on each player's device, with keys
 revealed by the protocol after a completed round. WebRTC encrypts transport;
 direct peers can learn each other's network addresses. This browser mode does
-not preserve Tor anonymity. The inherited custom card protocol is unaudited and
-has known structure leakage: card index 1 remains 1 under every encryption
-layer, revealing that card's position. This port does not guarantee card secrecy
-or cheating resistance. Fixing the cryptographic design needs a separate review;
-verifying the final deck alone is insufficient.
+not preserve Tor anonymity. The custom card protocol (SRA mental poker) is
+unaudited. Cards are encoded as hash-derived quadratic residues, so ciphertexts
+no longer show a card's quadratic-residue bit or the fixed point 1. No helper
+decrypts ciphertexts for the player who chose them. After the key reveal every
+player recomputes each partial decryption it received, so cheating is detected
+after the hand. It is not prevented during play: two colluding players can make
+the third strip a layer from values of their choice. This does not guarantee card
+secrecy or cheating resistance; that needs zero-knowledge proofs of correct
+decryption and a separate review.
+
+All players need the same release: peers exchange a protocol version first and
+refuse to play across versions.
 
 A self-hosted router and managed hosting remain options for later deployment.
 The implementation does not modify a router or create external services.

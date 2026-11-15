@@ -3,11 +3,38 @@ use serde::{Deserialize, Serialize};
 use crate::game::bidding::BidAction;
 use crate::game::card::Card;
 
+/// Game protocol version. Bump on any change to message shapes or to the
+/// order of messages in a round; peers with different versions refuse to play.
+/// Version 1 (implicit, no version field) was the 15-hop deal with raw card
+/// indices. Version 2: 5-hop deal, 2-hop skat pickup, hashed QR card encoding.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Error text for a peer on another protocol version (0 = before versioning).
+pub fn protocol_mismatch(peer: &str, version: u32) -> String {
+    let theirs = if version == 0 {
+        "an older p2skat without protocol versioning".to_string()
+    } else {
+        format!("p2skat protocol v{}", version)
+    };
+    format!(
+        "{} runs {}, but this build uses protocol v{}. All players need the same p2skat release.",
+        peer, theirs, PROTOCOL_VERSION
+    )
+}
+
 /// All protocol messages exchanged between peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
-    /// Initial handshake — announce player name.
-    Hello { name: String },
+    /// Initial handshake — announce player name and protocol version.
+    /// Peers from before versioning omit `version`, which decodes as 0.
+    Hello {
+        name: String,
+        #[serde(default)]
+        version: u32,
+    },
+
+    /// First message of every game session, on every transport.
+    Protocol { version: u32 },
 
     /// Acknowledge all 3 players are connected, assign seats.
     GameStart {
@@ -31,20 +58,22 @@ pub enum Message {
         cards: Vec<String>,
     },
 
-    /// Partial decryption of specific card positions for a target player.
+    /// Cards from fixed deck positions with some players' layers removed.
+    /// Receivers check `indices` and `stripped` against the step they expect.
     PartialDecrypt {
-        /// The target player seat index who should receive these.
-        target: usize,
+        /// Deck positions of these cards in the final shuffled deck.
+        indices: Vec<usize>,
+        /// Seats whose encryption layers have been removed, in order.
+        stripped: Vec<usize>,
         /// Partially decrypted card values (hex strings).
         cards: Vec<String>,
-        /// Which positions in the deck these correspond to.
-        indices: Vec<usize>,
     },
 
     /// A bid action during the bidding phase.
     BidMsg { seat: usize, action: BidActionMsg },
 
-    /// Declarer picks up the Skat (requests decryption of Skat cards).
+    /// Declarer picks up the Skat. Carries no ciphertexts: helpers take the
+    /// skat positions from their own copy of the final deck.
     SkatRequest,
 
     /// Declarer puts down cards and declares the contract.

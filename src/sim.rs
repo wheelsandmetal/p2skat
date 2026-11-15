@@ -2,7 +2,7 @@ use num_bigint::BigUint;
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-use crate::crypto::protocol::{card_values, encrypt_and_shuffle, verify_hand, DealPositions};
+use crate::crypto::protocol::{encrypt_and_shuffle, verify_hand, CardCodec, DealPositions};
 use crate::crypto::sra::SraKeyPair;
 use crate::game::bidding::{BidAction, BiddingState, Seat};
 use crate::game::card::{Card, Suit};
@@ -22,6 +22,7 @@ pub fn run(config: &SimConfig) -> Result<(), String> {
     } else {
         BigUint::from(7919u64)
     };
+    let codec = CardCodec::new(&prime)?;
 
     let mut scoreboard = ScoreBoard::new();
     let mut rng = rand::thread_rng();
@@ -48,18 +49,18 @@ pub fn run(config: &SimConfig) -> Result<(), String> {
             SraKeyPair::generate(&prime),
         ];
 
-        let values = card_values();
+        let values = codec.deck();
         let deck = encrypt_and_shuffle(
             &encrypt_and_shuffle(&encrypt_and_shuffle(&values, &keys[0]), &keys[1]),
             &keys[2],
         );
 
         let mut hands: [Vec<Card>; 3] = [
-            decrypt_to_cards(&deck[DealPositions::player_range(0)], &keys),
-            decrypt_to_cards(&deck[DealPositions::player_range(1)], &keys),
-            decrypt_to_cards(&deck[DealPositions::player_range(2)], &keys),
+            decrypt_to_cards(&deck[DealPositions::player_range(0)], &keys, &codec),
+            decrypt_to_cards(&deck[DealPositions::player_range(1)], &keys, &codec),
+            decrypt_to_cards(&deck[DealPositions::player_range(2)], &keys, &codec),
         ];
-        let skat = decrypt_to_cards(&deck[DealPositions::skat_range()], &keys);
+        let skat = decrypt_to_cards(&deck[DealPositions::skat_range()], &keys, &codec);
 
         if config.verbose {
             for i in 0..3 {
@@ -140,17 +141,14 @@ pub fn run(config: &SimConfig) -> Result<(), String> {
 
 /// Decrypt a slice of triply-encrypted BigUint values using all 3 keys.
 /// Order of decryption doesn't matter (SRA commutativity).
-fn decrypt_to_cards(encrypted: &[BigUint], keys: &[SraKeyPair; 3]) -> Vec<Card> {
+fn decrypt_to_cards(encrypted: &[BigUint], keys: &[SraKeyPair; 3], codec: &CardCodec) -> Vec<Card> {
     let step1: Vec<BigUint> = encrypted.iter().map(|c| keys[0].decrypt(c)).collect();
     let step2: Vec<BigUint> = step1.iter().map(|c| keys[1].decrypt(c)).collect();
     let plaintext: Vec<BigUint> = step2.iter().map(|c| keys[2].decrypt(c)).collect();
 
     plaintext
         .iter()
-        .map(|v| {
-            let idx: u64 = v.try_into().expect("card value fits u64");
-            Card::from_index(idx).expect("valid card index after decryption")
-        })
+        .map(|v| codec.decode(v).expect("valid card encoding after decryption"))
         .collect()
 }
 

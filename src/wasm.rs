@@ -14,7 +14,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::{
     crypto::{
-        protocol::{card_values, encrypt_and_shuffle, verify_hand, DealPositions},
+        protocol::{encrypt_and_shuffle, verify_hand, CardCodec, DealPositions},
         sra::{shared_prime, SraKeyPair},
     },
     game::{
@@ -217,22 +217,22 @@ pub fn crypto_self_check() -> std::result::Result<String, JsValue> {
         SraKeyPair::generate(&prime),
         SraKeyPair::generate(&prime),
     ];
-    let mut deck = card_values();
+    let codec = CardCodec::new(&prime).map_err(js_error)?;
+    let mut deck = codec.deck();
     for key in &keys {
         deck = encrypt_and_shuffle(&deck, key);
     }
-    // Exercise the same pairwise removal used when each player receives a hand.
+    // Exercise the layer order of the 5-hop deal: the hand of `player` loses
+    // the layers of `chain[player]` in turn, then the owner's own.
+    let chain = [[2, 1], [2, 0], [0, 1]];
     for player in 0..3 {
         for value in &deck[DealPositions::player_range(player)] {
             let mut card = value.clone();
-            for other in 0..3 {
-                if player != other {
-                    card = keys[other].decrypt(&card);
-                }
+            for other in chain[player] {
+                card = keys[other].decrypt(&card);
             }
             card = keys[player].decrypt(&card);
-            let index: u64 = (&card).try_into().map_err(js_error)?;
-            if Card::from_index(index).is_none() {
+            if codec.decode(&card).is_none() {
                 return Err(js_error("Deal self-check failed"));
             }
         }
