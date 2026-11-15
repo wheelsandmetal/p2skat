@@ -179,7 +179,8 @@ export class RelayUploader {
   pump(now = false) {
     if (this.closed || this.inFlight || this.timer) return;
     if (!this.queue.length && !(this.ackWanted && this.getAck() > this.ackSent)) return;
-    if (!now && this.lingerMs > 0) {
+    // Hidden tabs clamp timers to >= 1 s, so they send at once instead.
+    if (!now && this.lingerMs > 0 && !globalThis.document?.hidden) {
       this.timer = this.timers.setTimeout(() => {
         this.timer = null;
         this.pump(true);
