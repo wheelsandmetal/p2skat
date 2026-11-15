@@ -78,8 +78,9 @@ decryption and a separate review.
 All players need the same release: peers exchange a protocol version first and
 refuse to play across versions.
 
-A self-hosted router and managed hosting remain options for later deployment.
-The implementation does not modify a router or create external services.
+To host a table as a Tor onion service on an OpenWrt router, see
+[Host a table as an onion service](#host-a-table-as-an-onion-service). Nothing
+else configures a router or creates external services.
 See [the implementation plan](WEBRTC_PLAN.md).
 
 ## Play over Tor (relay mode)
@@ -134,6 +135,80 @@ Over Tor each message takes about 0.4–1.4 s, so a deal takes several seconds
 plus the card crypto; card play feels normal. The page shows progress while
 keys are exchanged and cards are shuffled.
 
+### Host a table as an onion service
+
+The table server and a Tor onion service fit on a small always-on box: the
+server is a static binary under 1 MB that serves the page and relays messages
+on `127.0.0.1:8080`, and Tor publishes it as `http://<address>.onion/`. No
+port forward is needed. `scripts/deploy-router.sh` sets this up over SSH on an
+OpenWrt 24.10 router (aarch64, `opkg`, procd):
+
+```sh
+scripts/deploy-router.sh root@router            # build, copy, install; prints the onion address
+scripts/deploy-router.sh --check root@router    # conformance suite and memory, through an SSH tunnel
+scripts/deploy-router.sh --uninstall root@router
+```
+
+It builds the static `aarch64-unknown-linux-musl` server
+(`scripts/build-router.sh`) and the web app inside `nix develop`
+(`--no-build` uses existing builds; `--dry-run` builds and stages, prints the
+commands and generated files, and sends nothing). It copies them with `scp -O`
+(OpenWrt's dropbear has no SFTP). On the router it:
+
+- installs `tor-basic` with `opkg` if tor is missing;
+- creates an unprivileged `p2skat` account and installs `/usr/bin/p2skat-room`
+  and `/usr/share/p2skat/web/`;
+- adds a marked block to `/etc/tor/torrc` (`SocksPort 0`,
+  `HiddenServiceDir /etc/tor/p2skat/`, `HiddenServicePort 80 127.0.0.1:8080`)
+  and leaves the rest of the file alone;
+- writes the onion address to `/etc/config/p2skat` and installs the procd
+  service `/etc/init.d/p2skat-room` (runs as `p2skat`, respawns,
+  `--allowed-host <address>.onion --max-rooms 8`);
+- adds `/etc/tor/`, the init script and the config file to
+  `/etc/sysupgrade.conf`, warns if NTP is off (Tor won't start with a wrong
+  clock) and checks `/api/health`.
+
+Running it again is safe. It restarts the server only if something changed,
+and a restart ends every running game. If ssh rejects `~/.ssh/config` ("Bad
+owner or permissions", seen in sandboxes), copy it to a private file and pass
+`SSH_CONFIG=/path/to/copy`.
+
+**Back up `/etc/tor/p2skat/` offline and keep it private.** It holds the onion
+service's key, which is the table's identity: lose it and the address changes;
+anyone who has it can impersonate the table.
+
+```sh
+ssh root@router 'tar -czf - -C / etc/tor/p2skat' > p2skat-onion-key.tgz
+ssh root@router 'tar -xzf - -C /' < p2skat-onion-key.tgz    # restore, then deploy
+```
+
+A sysupgrade removes packages and `/usr` but keeps `/etc/tor/`. Run the deploy
+script again afterwards to restore the table at the same address. To move the
+table to another router, restore the key directory first.
+
+`--uninstall` removes the service, its files, the torrc block and the
+sysupgrade lines. It keeps the key unless you add `--purge-keys`, and leaves
+`tor-basic` and the `p2skat` account installed.
+
+`--check` needs `python3` (e.g. in `nix develop`). Through an SSH port forward
+it runs `scripts/test_serve.py`'s tests that create no tables against the live
+server, so running games aren't disturbed. Then it runs the full suite against
+a temporary second instance of the deployed binary, with the suite's short
+timings and the default table limit. It reports the binary size and the peak
+memory (VmHWM) of both instances.
+
+`scripts/onion-local.sh` does the same on a laptop with the system `tor` and a
+throwaway address, to try Tor Browser without a router.
+
+Hosting a table means:
+
+- **you serve the code.** The relay encryption protects against a curious
+  host, not one that changes the JavaScript or Wasm it serves;
+- the server sees the players' names, message sizes and timing (there's no
+  padding), though not the cards or anyone's IP address;
+- reloading a tab ends that game, and restarting the server (or the router)
+  ends all games. Tables live only in memory.
+
 ## Native app
 
 ```sh
@@ -165,7 +240,11 @@ test with short timings; `P2SKAT_SERVER_URL=http://host:port` targets a running
 server instead and skips tests that need a special configuration.
 
 `scripts/build-router.sh` (inside `nix develop`) builds a static
-`aarch64-unknown-linux-musl` room server for the OpenWrt router.
+`aarch64-unknown-linux-musl` room server for the OpenWrt router;
+`scripts/deploy-router.sh --check` runs the suite against it there (see
+[Host a table as an onion service](#host-a-table-as-an-onion-service)).
+`P2SKAT_SERVER_HOST=<name>` makes the suite send that `Host` header, for a
+server started with `--allowed-host`.
 
 For the three-browser smoke test, start the static server above and have
 Chromium on your PATH (or set `CHROMIUM_PATH`). Install Playwright's driver in a

@@ -600,6 +600,49 @@ Target: OpenWrt 24.10 (`opkg`), `aarch64_cortex-a53`.
 5. Keep no hostnames or addresses in the repo.
 6. README section "Play over Tor" with the caveats below.
 
+#### Phase 5 status (2026-11-15): tooling written, not yet run on the router
+
+- `scripts/deploy-router.sh <ssh-host>` (local, bash) builds or reuses the
+  router binary and `web/pkg`, stages only the served files (html/css/js/mjs,
+  `pkg/*.js`, `pkg/*.wasm`; ≈ 680 KiB gzipped), copies them with `scp -O` and
+  runs `scripts/router-setup.sh install` (POSIX sh, busybox ash) as root. One
+  SSH control connection per run; `SSH_CONFIG` passes `-F`. `--dry-run`
+  builds and stages, then prints the commands and the generated files.
+- Router side, idempotent: `opkg install tor-basic` only if `/usr/sbin/tor`
+  is missing; `p2skat` user and group through `/lib/functions.sh`
+  (`group_add_next`, `user_add`); binary and web files swapped in only if
+  their checksums changed; a marked block in the torrc that tor reads
+  (`uci get tor.conf.default`, default `/etc/tor/torrc`). `SocksPort 0` is
+  added only if torrc has no SocksPort of its own. `/etc/tor/p2skat` belongs
+  to tor's account: torrc `User`, else procd's `user` in `/etc/init.d/tor`,
+  else root. tor restarts only if the block changed or tor isn't running; the
+  script waits ≤ 60 s for `hostname`, writes the address to
+  `/etc/config/p2skat` (UCI, read by the procd init script), adds a marked
+  `/etc/tor/`, init script and config block to `/etc/sysupgrade.conf`, and
+  restarts `p2skat-room` only if anything changed.
+- `--allowed-host` also applies to `/api/health`, so the router-side health
+  check sends `Host: <addr>.onion`: `wget --header` (busybox or GNU wget),
+  else `nc`, else it accepts the 421 a foreign Host gets as a sign of life,
+  because OpenWrt's default `wget` (uclient-fetch) can't set headers.
+- `--uninstall [--purge-keys]` removes service, files and both marked blocks
+  and keeps the keys by default (with a warning). `--check` runs the
+  conformance suite through `ssh -O forward`: `StaticTests` against the live
+  server (it creates no tables, so it can't hit `--max-rooms 8` or disturb
+  games) and the full suite (`P2SKAT_SERVER_FAST=1`) against a temporary
+  root-owned instance of the deployed binary with the same `--allowed-host`.
+  It reports binary size and VmHWM/VmRSS and judges acceptance 6. The suite
+  gained `P2SKAT_SERVER_HOST` for the Host/Origin header.
+- `scripts/onion-local.sh [port]` runs a throwaway onion service with the
+  system tor.
+- Verified locally only: shellcheck, `busybox ash -n`, router-side
+  install/re-install/uninstall in a fake root under busybox ash with stub
+  `opkg`/`uci`/`rc.common`; `--check` end to end with a fake `ssh` against a
+  native server; `onion-local.sh` with `DisableNetwork 1`.
+- To confirm on the router: tor-basic's torrc has `User tor` (else the HS
+  directory belongs to root, with a warning); `tor --verify-config` as root
+  accepts the block; whether `nc`/`setsid` exist in the busybox build; that
+  procd honours `no_new_privs`. Then run `--check` and acceptance 1.
+
 ## Risks and caveats
 
 - **Weak uplink.** Mitigated by stream supersede, resume, the
