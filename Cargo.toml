@@ -37,3 +37,18 @@ tor-cell = "0.40"
 tor-rtcompat = "0.40"
 safelog = "0.8"
 libsqlite3-sys = { version = "0.36", features = ["bundled"] }
+
+# The room server is a separate binary for the router; building the game
+# (cargo build, nix build, build-web.sh) does not touch it.
+[workspace]
+members = [".", "room"]
+default-members = ["."]
+
+# Small static binary for the router: cargo build -p p2skat-room --profile router
+[profile.router]
+inherits = "release"
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true

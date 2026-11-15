@@ -12,15 +12,15 @@ On NixOS, the development shell supplies Rust, the Wasm target, and the matching
 
 ```sh
 nix develop --command bash scripts/build-web.sh
-nix develop --command python3 scripts/serve.py
+nix develop --command cargo run --locked --release -p p2skat-room
 ```
 
 Open <http://localhost:8080>. The generated `web/pkg/` directory is ignored by
 Git; rebuild it after changing Rust. The frontend has no JavaScript build step
-or runtime package dependencies. The Python server serves the files and handles
-invite setup using only the standard library. If the old `python3 -m http.server`
-is still running, stop it with Ctrl+C before starting this server. Reload existing
-tabs after switching servers.
+or runtime package dependencies. The room server (`room/`, a small Rust binary
+independent of the game crate) serves the files and handles invite setup.
+`python3 scripts/serve.py` is the standard-library prototype with the same API
+and works the same way. Reload existing tabs after switching servers.
 
 ### Connect three players
 
@@ -42,9 +42,10 @@ allow three players, and expire after an hour without activity. Restarting the
 server loses its rooms; create a new table to invite new players.
 
 For other devices, the server must be reachable over HTTPS, including its `/api/`
-event streams. The default address is local to this computer. `--host` and
-`--port` select a different listening address; this script does not configure
-public hosting, HTTPS, or a TURN provider.
+event streams. The default address is local to this computer. `--bind` selects a
+different listening address (`--host` and `--port` for `serve.py`), and
+`--allowed-host` restricts the accepted `Host` header. The server does not
+configure public hosting, HTTPS, or a TURN provider. See `p2skat-room --help`.
 
 **Advanced → Manual connection** remains available for static-only hosting.
 Choose different seats and the same names on each device, then exchange the
@@ -93,8 +94,17 @@ cargo test --locked
 cargo run --locked -- simulate --rounds 10
 nix develop --command bash scripts/build-web.sh
 node --test web/*.test.mjs
-python3 -B -m unittest discover -s scripts -p 'test_serve.py' -v
+cargo test -p p2skat-room
+python3 -B scripts/test_serve.py                    # conformance suite against serve.py
+cargo build -p p2skat-room && P2SKAT_SERVER=rust python3 -B scripts/test_serve.py
 ```
+
+`test_serve.py` is a black-box HTTP/SSE suite. It starts a fresh server per
+test with short timings; `P2SKAT_SERVER_URL=http://host:port` targets a running
+server instead and skips tests that need a special configuration.
+
+`scripts/build-router.sh` (inside `nix develop`) builds a static
+`aarch64-unknown-linux-musl` room server for the OpenWrt router.
 
 For the three-browser smoke test, start the static server above and have
 Chromium on your PATH (or set `CHROMIUM_PATH`). Install Playwright's driver in a
