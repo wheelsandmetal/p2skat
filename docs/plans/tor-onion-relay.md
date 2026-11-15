@@ -1,6 +1,6 @@
 # Plan: Browser play over Tor through an onion relay on the router
 
-Status: draft v2. The first review (Fable 5.2) has been incorporated; see
+Status: draft v3. Review findings (Fable 5.2) incorporated and Phase 0 done (step 6 optional); see
 "Review log" at the end.
 Branch: `feat/tor-onion-relay` (from `master`)
 
@@ -91,10 +91,12 @@ On a laptop: `tor` with a throwaway `HiddenServiceDir` pointing at
    choice").
 6. **Real deal time**: hack a `/relay` passthrough into `serve.py` (~40 lines,
    plaintext, throwaway) and a minimal `RelayChannel`, then time one full deal
-   across three Tor Browsers. A deal is about 15 sequential message hops
+   across three Tor Browsers. A deal is 15 sequential message hops
    (3 shuffle passes, 12 deal steps; see `src/session.rs:280-420`), so
-   **expect 10–30 s**. If it's far worse, batching SRA rounds becomes a
-   prerequisite, not a follow-up.
+   expect ~9–17 s from the measured per-hop latency. **Optional now**: the
+   per-hop latency is measured and the 5-hop deal (Related work) is the fix
+   if this is too slow. It can fold into the Phase 4 `--relay` smoke run
+   instead of a throwaway prototype.
 7. **Router**: cross-build a hello-world for `aarch64-unknown-linux-musl` and
    run it on the router. Record free RAM and overlay space, and confirm the
    package manager (`opkg` expected on 24.10). **Done, see results below.**
@@ -368,8 +370,9 @@ uses (`label`, `ordered`, `maxRetransmits`, `maxPacketLifeTime`, `readyState`,
     testing in normal browsers and for people who don't want to share IPs.
   - The `BroadcastChannel` same-browser shortcut stays WebRTC-mode only.
   - Room-stream errors are fatal after start in relay mode (Phase 1).
-- Capability check on load: secure context, `crypto.subtle`, Wasm actually
-  instantiates. Plus a `<noscript>`. Message: "In Tor Browser, set Security
+- Capability check on load: secure context, `crypto.subtle`,
+  `typeof WebAssembly !== 'undefined'` (at Safer it's simply undefined;
+  Phase 0). Plus a `<noscript>`. Message: "In Tor Browser, set Security
   Level to Standard for this site."
 - Document in the UI that **reloading the page, or Android suspending the tab
   for long, ends the game**. Keys live only in memory and there's no rejoin.
@@ -429,8 +432,8 @@ Target: OpenWrt 24.10 (`opkg`), `aarch64_cortex-a53`.
 - **Weak uplink.** Mitigated by stream supersede, resume, the
   watchdog and the 120 s liveness window. The same binary and torrc run on any
   other always-on box if the router is too flaky.
-- **Latency**: 10–30 s per deal expected (measured in Phase 0). Card play is
-  fine.
+- **Latency**: 0.57–1.1 s per relay hop (Phase 0). That's ~9–17 s per deal
+  with today's 15-hop deal, ~3–6 s with the 5-hop deal. Card play is fine.
 - **The host serves the code.** E2E protects against a passive or curious host,
   not one serving modified JS/Wasm. Acceptable among friends; the README says
   so.
@@ -438,6 +441,23 @@ Target: OpenWrt 24.10 (`opkg`), `aarch64_cortex-a53`.
 - **Reload ends the game**; no rejoin.
 - **Onion key = table identity.** Losing it changes the address. Leaking it
   allows impersonation.
+
+## Related work: 5-hop deal (separate change, recommended first)
+
+Today a deal is 15 sequential hops. The shuffle takes 3. Then `deal_phase`
+deals the three hands one after another, with owner↔helper round trips:
+4 hops × 3 = 12. SRA layers commute and the hands are independent, so the
+deal can be restructured to 5 hops: hands in parallel, layers stripped in a
+chain helper→helper→owner, and seat 2 starting as soon as it holds the final
+deck. Over Tor that's ~3–6 s per deal instead of ~9–17 s, and it helps
+WebRTC and native TCP/Tor equally.
+
+It's a wire-protocol change in `Session` shared by every transport, so do it
+as its own change, together with the QR-encoding fix below and the
+decryption-oracle check (helpers must verify they are decrypting the deck's
+own ciphertexts), under one protocol version bump. It isn't a blocker for
+this plan: the relay works with either deal, and Phase 4 timings just need
+re-measuring after it lands.
 
 ## Separate issue found during review (not part of this plan)
 
@@ -453,7 +473,7 @@ affects all transports.
 - Embedding arti in `p2skat-room` instead of system `tor`.
 - Static hosting with public signaling (Nostr) for the WebRTC path.
 - Rejoin after a reload.
-- Batching SRA rounds, unless Phase 0 shows it's needed.
+- The 5-hop deal (see "Related work"; tracked separately).
 - Tor Browser ↔ native Tor client interop.
 
 ## Acceptance criteria
