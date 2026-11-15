@@ -287,6 +287,105 @@ error (`rooms.mjs:81-84`). Over Tor, both have to change:
 - When the Rust server passes the suite, the README switches to it, and
   `serve.py` is removed in a follow-up (the suite stays).
 
+#### Phase 1 results: the protocol as implemented (2026-11-15)
+
+Both `scripts/serve.py` and `room/` (`p2skat-room`) implement this; the
+29-test conformance suite in `scripts/test_serve.py` passes against both.
+The aarch64 router binary is 774 KB.
+
+**Errors.** Every API error is `{"error": "<human text>", "code": "<code>"}`.
+Clients branch on `code`, never on the status alone:
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `bad_request` | malformed body, frame, seq, payload, `ack`, `after` |
+| 400 | `wrong_mode` | `signal` in a relay room, `relay` in a WebRTC room, `join` with the other `mode` |
+| 401 | `unauthorized` | bad token |
+| 403 | `forbidden` | Origin rule |
+| 404 | `not_found` / `room_closed` | unknown table or endpoint / table closed (kept 30 s) |
+| 409 | `room_full` / `duplicate_signal` | |
+| 413 | `too_large` | body or frame payload over the cap |
+| 415 | `unsupported_media_type` | not JSON |
+| 421 | `wrong_host` | `--allowed-host` mismatch |
+| 422 | `gap` | also carries `"expected"` (below); nothing in the batch was applied |
+| 429 | `over_limit` | rate or memory limit; the table is now **closed** with the same message |
+| 503 | `busy` | `--max-rooms` reached |
+
+**Create / join.** `POST /api/rooms` `{"name", "browser", "mode"?}` (`mode`
+defaults to `"webrtc"`). `POST /api/rooms/{id}/join` `{"name", "browser",
+"mode"?}`; a `mode` that differs from the table's fails with `wrong_mode`
+without taking a seat. Both return
+`{"room", "seat", "token", "players": [{"seat", "name", "browser"}], "mode"}`.
+
+**Relay.** `POST /api/rooms/{id}/relay`, `Authorization: Bearer <token>`,
+body `{"frames": [{"to": seat, "seq": n, "payload": "<base64url>"}], "ack"?: id}`.
+
+- Exactly those keys; `seq` is 1 … 2^53−1, per (sender, `to`); the first frame
+  on a pair is `seq` 1.
+- `payload` is unpadded base64url, non-empty, ≤ 65 600 decoded bytes (413
+  above). Body ≤ 1 MiB + 4 KiB.
+- `seq <= last` is skipped, `last+1` is forwarded, anything larger rejects the
+  whole batch with 422 `gap`.
+- `frames: []` is valid (an ack-only POST). `ack` (optional) discards the
+  sender's own log entries with id ≤ `ack`; it must be < the next event id.
+  **The browser client should send `ack: <last event id>` on every relay POST**
+  so the log stays small during a healthy stream.
+- 200 response: `{"expected": {"<seat>": next_seq, …}}` for every other seated
+  player (e.g. `{"1": 4, "2": 1}`). The 422 body carries the same `expected`.
+- Token bucket: 50 frames/s, burst 50, counted per frame (duplicates
+  included).
+
+**Events.** `GET /api/rooms/{id}/events?token=<token>&after=<id>`. The resume
+point is `max(after, Last-Event-ID)`; an id beyond the last event is 400.
+Connecting acknowledges (discards) every event ≤ that point, supersedes any
+older stream for the player (it ends normally), and replays the rest. Stream
+format:
+
+```
+retry: 2000
+
+data: {"type":"players","players":[…]}          ← no id: snapshot on connect and on every join, not logged
+
+id: 7
+data: {"type":"relay","from":0,"seq":3,"payload":"…"}
+
+id: 2
+data: {"type":"signal","from":0,"signal":"…"}   ← WebRTC rooms only
+
+event: ping
+data: {"type":"ping"}                            ← after 10 s without other output, no id
+
+id: 8
+data: {"type":"closed","message":"Bert lost connection."}   ← last event; the stream then ends
+```
+
+Event ids are per player, start at 1 and increase by one per logged event
+(`relay`, `signal`, `closed`). `from` is always set by the server. A stream
+opened on a recently closed table replays only its `closed` event.
+
+**Log and limits.** Each player's log holds events until acknowledged. When a
+limit (256 events or 1 MiB per player, 16 MiB total) is reached, events that
+were already written to the player's stream are discarded first; if that is
+not enough the table closes with `over_limit`. A later resume from before a
+discarded, unacknowledged event closes the table with "<name> missed messages
+after a connection problem."
+
+**Liveness.** Relay tables only: a player without a stream for 120 s closes
+the table with "<name> lost connection." WebRTC tables keep today's behaviour
+(signaling loss doesn't end a peer game). Tables expire after 1 h without
+activity; an attached stream counts as activity.
+
+**Knobs (environment, both servers).** `P2SKAT_HEARTBEAT_MS` (10000),
+`P2SKAT_LIVENESS_MS` (120000), `P2SKAT_ROOM_TTL_MS` (3600000),
+`P2SKAT_CLOSED_RETAIN_MS` (30000), `P2SKAT_RATE` / `P2SKAT_BURST` (50),
+`P2SKAT_LOG_EVENTS` (256), `P2SKAT_LOG_BYTES` (1048576),
+`P2SKAT_TOTAL_BYTES` (16777216). Fault injection, tests only:
+`P2SKAT_FAULT_LATENCY_MS=800,400` delays every logged SSE event and every POST
+response by 800 ± 400 ms (order per player is kept);
+`P2SKAT_FAULT_DROP_S=N` cuts one random attached player's SSE stream and
+in-flight (delayed) POSTs every N s. A dropped POST may already have been
+applied: retry it unchanged.
+
 ### Phase 2: end-to-end encrypted relay channels (browser)
 
 **What this buys, stated honestly.** Much game traffic is broadcast anyway
