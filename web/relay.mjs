@@ -145,13 +145,15 @@ export function frameAad(roomId, from, to, seq) {
 
 // Drains every pair's frames through one in-flight POST, batching whatever queued meanwhile.
 // Frames stay queued until the server's `expected` confirms them; a retry resends the same
-// frame objects, so the ciphertext under a given seq never changes.
+// frame objects, so the ciphertext under a given seq never changes. An idle uploader lingers
+// for `lingerMs` first, so a burst of sends (e.g. the same deck to both peers) shares one POST
+// instead of the second waiting a whole round trip behind the first.
 export class RelayUploader {
   constructor({ post, getAck = () => 0, onFatal, onConfirmed = () => {}, timeoutMs = 30000,
     backoffMs = [250, 500, 1000, 2000, 4000, 8000], giveUpMs = 120000, closedGraceMs = 3000,
-    maxBatchFrames = 32, maxBatchChars = 768 * 1024, timers = globalThis, now = () => Date.now() }) {
+    maxBatchFrames = 32, maxBatchChars = 768 * 1024, lingerMs = 15, timers = globalThis, now = () => Date.now() }) {
     Object.assign(this, { post, getAck, onFatal, onConfirmed, timeoutMs, backoffMs, giveUpMs, closedGraceMs,
-      maxBatchFrames, maxBatchChars, timers, now });
+      maxBatchFrames, maxBatchChars, lingerMs, timers, now });
     this.queue = [];
     this.inFlight = null;
     this.timer = null;
@@ -173,9 +175,17 @@ export class RelayUploader {
     this.pump();
   }
 
-  pump() {
+  // `now`: frames that already waited (behind a POST or a backoff) go without lingering.
+  pump(now = false) {
     if (this.closed || this.inFlight || this.timer) return;
     if (!this.queue.length && !(this.ackWanted && this.getAck() > this.ackSent)) return;
+    if (!now && this.lingerMs > 0) {
+      this.timer = this.timers.setTimeout(() => {
+        this.timer = null;
+        this.pump(true);
+      }, this.lingerMs);
+      return;
+    }
     void this.flush();
   }
 
@@ -212,7 +222,7 @@ export class RelayUploader {
         this.ackSent = Math.max(this.ackSent, ack);
         this.failures = 0;
         this.lastSuccess = this.now();
-        return this.pump();
+        return this.pump(true);
       }
       if (status === 422 && data?.code === 'gap' && this.validExpected(data.expected)) {
         // Only frames the server already has can be skipped; anything else it lost for good.
@@ -223,7 +233,7 @@ export class RelayUploader {
         if (this.queue.length === before || [...first].some(([to, seq]) => data.expected[String(to)] !== seq)) {
           throw new Error('The table server lost messages. The table has ended.');
         }
-        return this.pump();
+        return this.pump(true);
       }
       if (status >= 500 || (status === 200 && !data) || status === undefined) return this.retry();
       if (status === 404 && (data?.code === 'room_closed' || data?.code === 'not_found')) {
@@ -260,7 +270,7 @@ export class RelayUploader {
     const base = this.backoffMs[Math.min(this.failures, this.backoffMs.length) - 1];
     this.timer = this.timers.setTimeout(() => {
       this.timer = null;
-      this.pump();
+      this.pump(true);
     }, base * (0.75 + Math.random() * 0.5));
   }
 

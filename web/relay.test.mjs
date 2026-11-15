@@ -310,7 +310,7 @@ test('one POST in flight; everything queued meanwhile goes in the next batch wit
   const { calls, post } = manualPost();
   let ack = 3;
   const confirmed = [];
-  const uploader = new RelayUploader({ post, getAck: () => ack, onFatal: assert.fail, onConfirmed: f => confirmed.push(`${f.to}:${f.seq}`) });
+  const uploader = new RelayUploader({ lingerMs: 0, post, getAck: () => ack, onFatal: assert.fail, onConfirmed: f => confirmed.push(`${f.to}:${f.seq}`) });
   uploader.enqueue(frame(1, 1));
   uploader.enqueue(frame(1, 2));
   uploader.enqueue(frame(2, 1));
@@ -335,10 +335,26 @@ test('one POST in flight; everything queued meanwhile goes in the next batch wit
   assert.equal(uploader.queue.length, 0);
 });
 
+test('an idle uploader lingers briefly so a burst of sends shares one POST', async () => {
+  const { calls, post } = manualPost();
+  const uploader = new RelayUploader({ post, onFatal: assert.fail, lingerMs: 5 });
+  uploader.enqueue(frame(1, 1));
+  await settle();
+  uploader.enqueue(frame(2, 1));
+  assert.equal(calls.length, 0);
+  await waitFor(() => calls.length === 1);
+  assert.deepEqual(calls[0].body.frames.map(f => [f.to, f.seq]), [[1, 1], [2, 1]]);
+  uploader.enqueue(frame(1, 2));
+  calls[0].resolve(ok({ 1: 2, 2: 2 }));
+  await settle();
+  assert.equal(calls.length, 2, 'frames that waited behind a POST go at once');
+  uploader.close();
+});
+
 test('a 200 reply that does not confirm a sent frame is fatal', async () => {
   const { calls, post } = manualPost();
   const failures = [];
-  const uploader = new RelayUploader({ post, onFatal: error => failures.push(error.message) });
+  const uploader = new RelayUploader({ lingerMs: 0, post, onFatal: error => failures.push(error.message) });
   uploader.enqueue(frame(1, 1));
   calls[0].resolve(ok({ 1: 1, 2: 1 }));
   await waitFor(() => failures.length);
@@ -347,7 +363,7 @@ test('a 200 reply that does not confirm a sent frame is fatal', async () => {
 
 test('failed and timed-out POSTs are retried with identical ciphertext', async () => {
   const { calls, post } = manualPost();
-  const uploader = new RelayUploader({ post, onFatal: assert.fail, backoffMs: [1], timeoutMs: 20 });
+  const uploader = new RelayUploader({ lingerMs: 0, post, onFatal: assert.fail, backoffMs: [1], timeoutMs: 20 });
   uploader.enqueue(frame(1, 1));
   calls[0].reject(new TypeError('Failed to fetch'));
   await waitFor(() => calls.length === 2);
@@ -367,7 +383,7 @@ test('failed and timed-out POSTs are retried with identical ciphertext', async (
 test('a gap reply skips frames the server already holds and fails if it lost any', async () => {
   const { calls, post } = manualPost();
   const failures = [];
-  const uploader = new RelayUploader({ post, onFatal: error => failures.push(error.message), backoffMs: [1], timeoutMs: 1000 });
+  const uploader = new RelayUploader({ lingerMs: 0, post, onFatal: error => failures.push(error.message), backoffMs: [1], timeoutMs: 1000 });
   uploader.enqueue(frame(1, 1));
   uploader.enqueue(frame(1, 2));
   uploader.enqueue(frame(1, 3));
@@ -387,14 +403,14 @@ test('a gap reply skips frames the server already holds and fails if it lost any
 test('terminal server errors end the table with the server message; a closed table waits for its reason', async () => {
   const { calls, post } = manualPost();
   const failures = [];
-  const uploader = new RelayUploader({ post, onFatal: error => failures.push(error.message), closedGraceMs: 10 });
+  const uploader = new RelayUploader({ lingerMs: 0, post, onFatal: error => failures.push(error.message), closedGraceMs: 10 });
   uploader.enqueue(frame(1, 1));
   calls[0].resolve({ status: 429, data: { error: 'Ada sent messages too quickly. Create a new table.', code: 'over_limit' } });
   await waitFor(() => failures.length);
   assert.deepEqual(failures, ['Ada sent messages too quickly. Create a new table.']);
   const second = manualPost();
   const later = [];
-  const closing = new RelayUploader({ post: second.post, onFatal: error => later.push(error.message), closedGraceMs: 10 });
+  const closing = new RelayUploader({ lingerMs: 0, post: second.post, onFatal: error => later.push(error.message), closedGraceMs: 10 });
   closing.enqueue(frame(1, 1));
   second.calls[0].resolve({ status: 404, data: { error: 'This table ended or expired', code: 'room_closed' } });
   await settle(1);
@@ -407,7 +423,7 @@ test('the uploader gives up after a long outage, and sends ack-only POSTs on req
   let clock = 0;
   const failures = [];
   const calls = [];
-  const uploader = new RelayUploader({ post: async body => { calls.push(body); throw new TypeError('offline'); },
+  const uploader = new RelayUploader({ lingerMs: 0, post: async body => { calls.push(body); throw new TypeError('offline'); },
     getAck: () => 40, onFatal: error => failures.push(error.message), backoffMs: [1], giveUpMs: 100, now: () => clock });
   uploader.requestAck();
   assert.deepEqual(calls, [{ frames: [], ack: 40 }]);
