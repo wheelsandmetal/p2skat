@@ -11,6 +11,9 @@ With P2SKAT_SERVER_URL the suite uses an already running server. Tests that
 need a special configuration are skipped. Tests that need short timings run
 only if the server was started with the environment printed by
 `python3 scripts/test_serve.py --print-env` and P2SKAT_SERVER_FAST=1 is set.
+P2SKAT_SERVER_HOST=<name> sends that Host header (and the matching Origin), for
+a server started with --allowed-host and reached through a tunnel, as
+`scripts/deploy-router.sh --check` does.
 """
 import base64
 import concurrent.futures
@@ -165,6 +168,7 @@ class ConformanceTest(unittest.TestCase):
         env, args, fast = (getattr(test, "server_env", {}), getattr(test, "server_args", ()),
                            getattr(test, "server_fast", False))
         self.process = None
+        self.host_header = None
         external = os.environ.get("P2SKAT_SERVER_URL")
         if external:
             if env or args:
@@ -173,10 +177,11 @@ class ConformanceTest(unittest.TestCase):
                 self.skipTest("needs short timings (P2SKAT_SERVER_FAST=1)")
             parsed = urlsplit(external)
             self.host, self.port = parsed.hostname, parsed.port or 80
+            self.host_header = os.environ.get("P2SKAT_SERVER_HOST") or None
         else:
             self.process = ServerProcess(env, args)
             self.host, self.port = self.process.host, self.process.port
-        self.origin = f"http://{self.host}:{self.port}"
+        self.origin = f"http://{self.host_header or f'{self.host}:{self.port}'}"
         self.streams = []
 
     def tearDown(self):
@@ -192,7 +197,10 @@ class ConformanceTest(unittest.TestCase):
 
     def raw(self, method, path, body=None, headers=None):
         connection = self.connection()
-        connection.request(method, path, body, headers or {})
+        headers = dict(headers or {})
+        if self.host_header and "Host" not in headers:
+            headers["Host"] = self.host_header
+        connection.request(method, path, body, headers)
         response = connection.getresponse()
         data = response.read()
         connection.close()
@@ -226,7 +234,9 @@ class ConformanceTest(unittest.TestCase):
         path = f"/api/rooms/{room}/events?token={player['token']}"
         if after is not None:
             path += f"&after={after}"
-        connection.putrequest("GET", path)
+        connection.putrequest("GET", path, skip_host=bool(self.host_header))
+        if self.host_header:
+            connection.putheader("Host", self.host_header)
         if last_event_id is not None:
             connection.putheader("Last-Event-ID", str(last_event_id))
         connection.endheaders()
