@@ -122,18 +122,61 @@ Consequences for the plan:
 - The < 3 MB / < 20 MB RSS targets have plenty of headroom. RAM isn't a
   constraint: keep `--max-rooms 8` as a sanity cap, not a memory budget.
 - Prefer `tor-basic` over `tor` in Phase 5.
-- Steps 1–6 (Tor Browser) are still open.
+
+**Steps 1–5, Tor Browser, 2026-11-15: passed. Step 6 is still open.**
+
+Setup: Tor Browser 15.0.25 (Firefox 140 ESR, Linux) → throwaway onion service
+on a laptop (tor 0.4.9.15). A probe page was served with the CSP the plan
+proposes, next to `serve.py` and the `feat/browser-webrtc` build.
+
+| Check | Standard | Safer |
+|---|---|---|
+| `isSecureContext` on `http://….onion` | ✅ true | ✅ true |
+| `RTCPeerConnection` | absent | absent |
+| `crypto.randomUUID`, `crypto.subtle` | ✅ | ✅ |
+| ECDH P-256 → HKDF → AES-GCM (with AAD) round trip | ✅ | ✅ |
+| HMAC-SHA256 via HKDF, sign + verify (tamper detected) | ✅ | ✅ |
+| X25519 in WebCrypto | supported | supported |
+| `WebAssembly` | ✅ instantiates under the CSP | ❌ **`WebAssembly` is undefined** (page and workers) |
+| Module worker + p2skat `crypto_self_check` | ✅ (also via the real app's self-check) | ❌ no Wasm |
+| Real app, Create table | ❌ fails at `networkConfiguration()` (no `RTCPeerConnection`), as expected | — |
+
+Security level doesn't affect the network results:
+
+| Check | Result |
+|---|---|
+| `Origin` on same-origin POST | `http://<addr>.onion:8081`, exactly matching `Host`. `serve.py`'s origin rule accepts it, so no change needed. |
+| POST round trip, 1 KB, sequential ×15 | min 417, **median 600**, p90 850–1317, max 1400 ms |
+| POST → SSE delivery (= one relay hop) ×10 | min 383, **median 567**, p90 1117 ms |
+| SSE automatic reconnect | ✅ sends `Last-Event-ID` (got `3` after a server-side drop). `readyState` stays `CONNECTING` (0) during the retry, not `CLOSED`. |
+| WebSocket `ws://` same-origin echo, 1 KB ×10 | ✅ works. min 350, **median 550**, p90 800 ms |
+
+Consequences for the plan:
+
+- **Phase 2 crypto works as designed** (P-256, HKDF, HMAC, AES-GCM) in Tor
+  Browser. Keep P-256: X25519 also works here, but P-256 has no ESR-version
+  risk.
+- **Standard level is required.** Detection is simply `typeof WebAssembly
+  === 'undefined'`. The page doesn't need to instantiate a test module (review
+  item I7 resolved). Safest (no JS) still needs the `<noscript>` message.
+- **The Origin check stays as is** (review item I7 resolved).
+- **Transport decision: batched POST + SSE.** WebSocket works with the same
+  latency (550 vs 567 ms per hop), so it buys no speed. SSE's built-in
+  `Last-Event-ID` reconnect is exactly the resume mechanism Phase 1 needs, the
+  lobby already uses POST + SSE, and `serve.py` stays stdlib-only for the
+  prototype. Revisit only if step 6 shows HTTP overhead matters.
+- **Deal time estimate**: about 15 sequential relay hops × 0.57–1.1 s ≈
+  **9–17 s per deal** plus crypto. This is consistent with the 10–30 s
+  planning figure. Step 6 measures it for real.
 
 ### Phase 1: relay protocol (prototype in `serve.py`, then the Rust server)
 
 #### Transport choice
 
-The default is **batched POST upstream + SSE downstream**, because it reuses the
-lobby's existing machinery. If Phase 0 shows WebSocket works over onion and is
-noticeably simpler or faster, use a single WebSocket per player for the
-in-game relay instead. It still needs the same application-level resume
-(below); only the HTTP-level framing goes away. Decide at the end of Phase 0.
-The rest of this section describes the POST + SSE version.
+**Decided (Phase 0): batched POST upstream + SSE downstream.** WebSocket over
+onion works with the same latency, so it buys nothing. SSE's native
+`Last-Event-ID` reconnect, confirmed in Tor Browser, provides resume, and the
+lobby already uses this machinery.
 
 #### Relay frames
 
