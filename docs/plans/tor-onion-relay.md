@@ -97,9 +97,32 @@ On a laptop: `tor` with a throwaway `HiddenServiceDir` pointing at
    prerequisite, not a follow-up.
 7. **Router**: cross-build a hello-world for `aarch64-unknown-linux-musl` and
    run it on the router. Record free RAM and overlay space, and confirm the
-   package manager (`opkg` expected on 24.10).
+   package manager (`opkg` expected on 24.10). **Done, see results below.**
 
 Record all results in this document before Phase 1.
+
+#### Phase 0 results
+
+**Step 7, router, 2026-11-15: passed.**
+
+| Check | Result |
+|---|---|
+| Release / target | OpenWrt 24.10, `aarch64_cortex-a53` |
+| RAM | Several hundred MB available, no swap. Idle load ≈ 0. |
+| Flash | Ample free space on `/overlay`, tmpfs on `/tmp`. |
+| Package manager | `opkg` (not `apk`) |
+| Tor | `tor` 0.4.9.13-r1 in the feed (1.4 MB). Deps: libevent2, libopenssl3, zlib, libcap. Also `tor-basic` (no relay/bridge code; enough for an onion service) and `tor-hs` (a UCI configurator for onion services, worth a look for Phase 5). |
+| NTP | `system.ntp.enabled = 1` |
+| Existing web server | `uhttpd` (LuCI) on the LAN. No conflict: `p2skat-room` binds `127.0.0.1:8080`. |
+| Cross-build | Rust 1.94 (repo's pinned rust-overlay) with target `aarch64-unknown-linux-musl`, `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld`. **No extra linker-flavor or self-contained flags needed.** Build scripts still need the host `cc`, so build inside `nix develop`. |
+| Test binary | tokio (current-thread) + hyper 1 http1 + serde_json, `[profile.router]` as specified: **594 KB** static, stripped. Ran from `/tmp`, served 201 requests, **VmHWM 556 KB**. |
+
+Consequences for the plan:
+
+- The < 3 MB / < 20 MB RSS targets have plenty of headroom. RAM isn't a
+  constraint: keep `--max-rooms 8` as a sanity cap, not a memory budget.
+- Prefer `tor-basic` over `tor` in Phase 5.
+- Steps 1–6 (Tor Browser) are still open.
 
 ### Phase 1: relay protocol (prototype in `serve.py`, then the Rust server)
 
@@ -208,9 +231,9 @@ error (`rooms.mjs:81-84`). Over Tor, both have to change:
 - `[profile.router]` in the **root** manifest: `opt-level="z"`, `lto`,
   `panic="abort"`, `codegen-units=1`, `strip`.
 - Add `aarch64-unknown-linux-musl` to the flake's rust targets. Link with
-  `rust-lld` (`-C linker=rust-lld`). Expect to need
-  `-C linker-flavor=ld.lld -C link-self-contained=yes`; Phase 0 step 7
-  settles it. `scripts/build-router.sh` produces the binary. Target: < 3 MB.
+  `rust-lld` (`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld`,
+  verified in Phase 0). `scripts/build-router.sh` runs inside `nix develop` and
+  produces the binary. Target: < 3 MB (a hyper spike was 594 KB).
 - Tests: make `scripts/test_serve.py` a **conformance suite parameterized by
   server URL**. It's black-box HTTP apart from its `from serve import …`. Run
   it against both servers until `serve.py` is retired. Add relay tests to it:
@@ -334,7 +357,8 @@ uses (`label`, `ordered`, `maxRetransmits`, `maxPacketLifeTime`, `readyState`,
 
 Target: OpenWrt 24.10 (`opkg`), `aarch64_cortex-a53`.
 
-1. `opkg install tor`. `/etc/tor/torrc`:
+1. `opkg install tor-basic` (or use `tor-hs` for UCI-managed config).
+   `/etc/tor/torrc`:
    ```
    SocksPort 0
    HiddenServiceDir /etc/tor/p2skat/
