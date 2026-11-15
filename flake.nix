@@ -14,7 +14,7 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ "x86_64-unknown-linux-musl" "wasm32-unknown-unknown" ];
+          targets = [ "x86_64-unknown-linux-musl" "wasm32-unknown-unknown" "aarch64-unknown-linux-musl" ];
         };
       in
       {
