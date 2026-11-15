@@ -404,6 +404,15 @@ affects all transports.
 6. The `p2skat-room` aarch64 binary is < 3 MB and < 20 MB RSS with one active
    room. The conformance suite passes against it on the router.
 
+## Execution
+
+- **Implementation, all phases (1–5):** Opus 5.5.
+- **Review:** Fable 5.2, after Phase 2 (E2E crypto) and after Phase 3
+  (reconnect and ordering). Each review is a fresh run with this plan, the
+  diff and the open findings.
+- **Phase 0 and router steps:** the user, or Opus 5.5 running unsandboxed
+  (they need Tor Browser and SSH to the router).
+
 ## Review log
 
 **v1 → v2, review by Fable 5.2.** Blockers fixed:
