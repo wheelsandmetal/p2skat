@@ -166,7 +166,8 @@ start_service() {
 	fi
 	procd_open_instance
 	procd_set_param command "$PROG" --bind "$bind" --web-dir "$web_dir" \
-		--allowed-host "$allowed_host" --max-rooms "$max_rooms"
+		--allowed-host "$allowed_host" --max-rooms "$max_rooms" \
+		--max-connections 96 --relay-only
 	procd_set_param user p2skat
 	procd_set_param no_new_privs 1
 	procd_set_param respawn 3600 5 0

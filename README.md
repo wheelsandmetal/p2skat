@@ -163,7 +163,8 @@ commands and generated files, and sends nothing). It copies them with `scp -O`
   and leaves the rest of the file alone;
 - writes the onion address to `/etc/config/p2skat` and installs the procd
   service `/etc/init.d/p2skat-room` (runs as `p2skat`, respawns,
-  `--allowed-host <address>.onion --max-rooms 8`);
+  `--allowed-host <address>.onion --max-rooms 8 --max-connections 96
+  --relay-only`);
 - adds `/etc/tor/`, the init script and the config file to
   `/etc/sysupgrade.conf`, warns if NTP is off (Tor won't start with a wrong
   clock) and checks `/api/health`.
