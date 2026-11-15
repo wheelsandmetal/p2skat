@@ -138,6 +138,8 @@ struct RoundRecord {
     received: Vec<Received>,
     /// Cards this player decrypted, with their final-deck positions.
     opened: Vec<(usize, Card)>,
+    /// The hand another player showed when declaring an ouvert game.
+    ouvert_hand: Option<Vec<Card>>,
 }
 
 /// A partial decryption received from `from`: final-deck `indices` with the
@@ -320,6 +322,12 @@ impl<T: Transport> Session<T> {
 
             let (value, decl_points) = score_revealed_hand(&state, &revealed_deck, final_bid)?;
             verify_plays(&revealed_deck, &plays, &contract, declarer_idx)?;
+            if let Some(shown) = &self.round.borrow().ouvert_hand {
+                verify_ouvert_hand(&revealed_deck, &plays, &contract, declarer_idx, shown)
+                    .map_err(|error| {
+                        anyhow::anyhow!("Cheating detected: {} {error}", self.names[declarer_idx])
+                    })?;
+            }
 
             score_board.record(declarer_idx, value, final_bid);
             ui.set_scores(&score_board.scores);
@@ -779,6 +787,8 @@ impl<T: Transport> Session<T> {
                                 .map(|card| card.to_card())
                                 .collect::<Result<Vec<_>>>()?;
                             ensure_unique_cards(&cards)?;
+                            // Checked against the revealed deck after play.
+                            self.round.borrow_mut().ouvert_hand = Some(cards);
                         }
                         anyhow::ensure!(!ouvert || revealed_hand.is_some(), "Missing ouvert hand");
                         let contract = Contract::new(
@@ -959,6 +969,31 @@ fn verify_plays(
     anyhow::ensure!(
         hands.iter().all(Vec::is_empty),
         "Unplayed cards in revealed hands"
+    );
+    Ok(())
+}
+
+/// An ouvert hand is the ten cards the declarer plays: in a Hand game exactly
+/// the dealt hand. The error completes "Cheating detected: <declarer> …".
+fn verify_ouvert_hand(
+    deck: &[Card],
+    plays: &[(usize, Card)],
+    contract: &Contract,
+    declarer: usize,
+    shown: &[Card],
+) -> Result<()> {
+    let held: Vec<Card> = if contract.modifiers.hand {
+        deck[DealPositions::player_range(declarer)].to_vec()
+    } else {
+        plays
+            .iter()
+            .filter(|(seat, _)| *seat == declarer)
+            .map(|(_, card)| *card)
+            .collect()
+    };
+    anyhow::ensure!(
+        shown.len() == held.len() && shown.iter().all(|card| held.contains(card)),
+        "showed an ouvert hand that differs from the cards they held"
     );
     Ok(())
 }
@@ -1194,6 +1229,36 @@ mod scoring_tests {
     }
 
     #[test]
+    fn ouvert_hand_must_match_the_revealed_deck() {
+        let (_, deck) = revealed_round(true, 1);
+        let ouvert = Modifiers {
+            hand: true,
+            ouvert: true,
+            ..Modifiers::default()
+        };
+        let contract = Contract::new(GameType::Grand, ouvert);
+        let mut shown = deck[DealPositions::player_range(0)].to_vec();
+        shown.reverse();
+        assert!(verify_ouvert_hand(&deck, &[], &contract, 0, &shown).is_ok());
+        // Showing a skat card instead of a held one is a lie about the hand.
+        shown[4] = deck[DealPositions::skat_range()][0];
+        let error = verify_ouvert_hand(&deck, &[], &contract, 0, &shown).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("differs from the cards they held"));
+        assert!(verify_ouvert_hand(&deck, &[], &contract, 1, &deck[..10]).is_err());
+        // Without Hand (not declarable today) the shown cards are the ones played.
+        let null_ouvert = Modifiers {
+            ouvert: true,
+            ..Modifiers::default()
+        };
+        let contract = Contract::new(GameType::Null, null_ouvert);
+        let plays: Vec<(usize, Card)> = deck[20..30].iter().map(|card| (2, *card)).collect();
+        assert!(verify_ouvert_hand(&deck, &plays, &contract, 2, &deck[20..30]).is_ok());
+        assert!(verify_ouvert_hand(&deck, &plays, &contract, 2, &deck[19..29]).is_err());
+    }
+
+    #[test]
     fn peers_score_pickup_from_original_hand_and_reconstructed_discards() {
         for my_seat in 0..3 {
             let (state, deck) = revealed_round(false, my_seat);
@@ -1340,6 +1405,8 @@ mod session_tests {
     struct Bot {
         rounds: u32,
         results: Vec<([i32; 3], u32)>,
+        /// Play one Grand Hand Ouvert round instead of two plain rounds.
+        ouvert: bool,
     }
     impl Frontend for Bot {
         fn set_round(&mut self, round: u32) {
@@ -1365,7 +1432,7 @@ mod session_tests {
             Ok(BidAction::Pass)
         }
         async fn ask_skat_pickup(&mut self, _: &[Card]) -> Result<bool> {
-            Ok(self.rounds == 1)
+            Ok(self.rounds == 1 && !self.ouvert)
         }
         async fn choose_skat_discard(&mut self, hand: &[Card]) -> Result<Vec<Card>> {
             Ok(hand[..2].to_vec())
@@ -1375,6 +1442,7 @@ mod session_tests {
                 GameType::Grand,
                 Modifiers {
                     hand,
+                    ouvert: self.ouvert,
                     ..Default::default()
                 },
             ))
@@ -1390,7 +1458,7 @@ mod session_tests {
             Ok(legal[0])
         }
         async fn wait_for_continue(&mut self) -> Result<bool> {
-            Ok(self.rounds < 2)
+            Ok(self.rounds < 2 && !self.ouvert)
         }
     }
 
@@ -1706,6 +1774,56 @@ mod session_tests {
             error.contains("Player 2 runs p2skat protocol v3"),
             "{error}"
         );
+    }
+
+    async fn play_ouvert_round(lie: bool) -> [Result<()>; 3] {
+        let [mut a, mut b, mut c] = sessions();
+        if lie {
+            // Seat 0 (the declarer when everyone passes) shows a card it does not hold.
+            *a.transport.tamper.borrow_mut() = Some(Box::new(|_, message| {
+                if let Message::Declaration {
+                    revealed_hand: Some(cards),
+                    ..
+                } = message
+                {
+                    let held: Vec<Card> =
+                        cards.iter().map(|card| card.to_card().unwrap()).collect();
+                    let other = (1..=32)
+                        .map(|index| Card::from_index(index).unwrap())
+                        .find(|card| !held.contains(card))
+                        .unwrap();
+                    cards[0] = other.into();
+                }
+            }));
+        }
+        let [mut ui_a, mut ui_b, mut ui_c] = std::array::from_fn::<_, 3, _>(|_| Bot {
+            ouvert: true,
+            ..Bot::default()
+        });
+        let results = timeout(async {
+            tokio::join!(
+                a.run_game(&mut ui_a),
+                b.run_game(&mut ui_b),
+                c.run_game(&mut ui_c)
+            )
+        })
+        .await
+        .expect("the round should complete");
+        [results.0, results.1, results.2]
+    }
+
+    #[tokio::test]
+    async fn an_ouvert_hand_is_checked_against_the_revealed_deck() {
+        for result in play_ouvert_round(false).await {
+            result.unwrap();
+        }
+        let [_, b, c] = play_ouvert_round(true).await;
+        for error in [b.unwrap_err(), c.unwrap_err()] {
+            assert_eq!(
+                error.to_string(),
+                "Cheating detected: Player 0 showed an ouvert hand that differs from the cards they held"
+            );
+        }
     }
 
     #[tokio::test]
