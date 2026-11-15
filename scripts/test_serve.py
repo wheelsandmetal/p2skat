@@ -22,8 +22,10 @@ import json
 import os
 import re
 import socket
+import contextlib
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -260,6 +262,36 @@ class ConformanceTest(unittest.TestCase):
     def relay(self, room, player, frames, **extra):
         return self.request(f"/api/rooms/{room}/relay", {"frames": frames, **extra}, player["token"])
 
+    @contextlib.contextmanager
+    def keepalive(self, room, players, every=0.3):
+        """Ack-only relay POSTs from these players in the background, like the browser client."""
+        stop = threading.Event()
+        statuses = []
+
+        def run():
+            while not stop.wait(every):
+                for player in players:
+                    statuses.append(self.relay(room, player, [])[0])
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            yield statuses
+        finally:
+            stop.set()
+            thread.join()
+
+    def raw_post_headers(self, path, length, token=None):
+        """Send only the headers of a JSON POST that announces `length` body bytes."""
+        sock = socket.create_connection((self.host, self.port), timeout=5)
+        host = self.host_header or f"{self.host}:{self.port}"
+        lines = [f"POST {path} HTTP/1.1", f"Host: {host}", f"Origin: {self.origin}",
+                 "Content-Type: application/json", f"Content-Length: {length}"]
+        if token:
+            lines.append(f"Authorization: Bearer {token}")
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        return sock
+
     def expect_error(self, result, status, code):
         self.assertEqual(result[0], status, result[1])
         self.assertEqual(result[1].get("code"), code, result[1])
@@ -380,7 +412,8 @@ class LobbyTests(ConformanceTest):
         started = time.monotonic()
         webrtc_streams[1].close()
         relay_streams[1].close()
-        closed = relay_streams[0].closed_event(5)
+        with self.keepalive(relay, players):  # Bert's keepalives cannot replace his stream
+            closed = relay_streams[0].closed_event(5)
         self.assertEqual(closed["message"], "Bert lost connection.")
         self.assertGreater(time.monotonic() - started, 1.2)
         self.assertEqual(relay_streams[2].closed_event(1), closed)
@@ -573,17 +606,6 @@ class RelayTests(ConformanceTest):
             self.assertEqual(self.relay(room, players[0], [{"to": 2, "seq": seq, "payload": payload(1000)}])[0], 200)
         self.expect_error(self.relay(room, players[0], [{"to": 2, "seq": 3, "payload": payload(1000)}]), 429, "over_limit")
 
-    @server(env={"P2SKAT_TOTAL_BYTES": "3000"})
-    def test_global_byte_limit_closes_the_room(self):
-        first, players = self.table("relay")
-        second, others = self.table("relay")
-        self.assertEqual(self.relay(first, players[0], [{"to": 1, "seq": 1, "payload": payload(1000)}])[0], 200)
-        self.assertEqual(self.relay(second, others[0], [{"to": 1, "seq": 1, "payload": payload(1000)}])[0], 200)
-        result = self.relay(second, others[0], [{"to": 1, "seq": 2, "payload": payload(1000)}])
-        self.expect_error(result, 429, "over_limit")
-        self.assertIn("out of message space", result[1]["error"])
-        self.assertEqual(self.relay(first, players[0], [])[0], 200)
-
     @server(env={"P2SKAT_RATE": "5", "P2SKAT_BURST": "5"})
     def test_rate_limit_closes_the_room(self):
         room, players = self.table("relay")
@@ -593,6 +615,97 @@ class RelayTests(ConformanceTest):
         self.assertIn("Ada sent messages too quickly", result[1]["error"])
         stream = self.stream(room, players[1])
         self.assertEqual(stream.data()["type"], "closed")
+
+
+    @server(fast=True)
+    def test_open_stream_without_keepalive_posts_is_lost(self):
+        # A frozen (e.g. SIGSTOPped) tab keeps its stream open but stops posting.
+        room, players = self.table("relay")
+        streams = [self.stream(room, player) for player in players]
+        started = time.monotonic()
+        with self.keepalive(room, [players[0], players[2]]):
+            closed = streams[0].closed_event(5)
+        self.assertEqual(closed["message"], "Bert lost connection.")
+        self.assertGreater(time.monotonic() - started, 1.2)
+        self.assertEqual(streams[1].closed_event(1), closed)
+
+    @server(fast=True)
+    def test_empty_keepalive_posts_keep_a_table_alive(self):
+        room, players = self.table("relay")
+        streams = [self.stream(room, player) for player in players]
+        for stream in streams:
+            self.assertEqual(stream.data()["type"], "players")
+        with self.keepalive(room, players) as statuses:
+            time.sleep(3.5)  # more than twice the 1.5 s liveness window
+        self.assertTrue(statuses and all(status == 200 for status in statuses), statuses)
+        self.assertIsNone(streams[0].next(0.2), "The table must stay open")
+        self.assertEqual(self.relay(room, players[0], [{"to": 1, "seq": 1, "payload": "AAAA"}])[0], 200)
+
+    @server(env={"P2SKAT_BODY_TIMEOUT_MS": "1000"})
+    def test_stalled_body_is_cut_off(self):
+        room, players = self.table("relay")
+        for sent in (b"", b'{"frames"'):
+            with self.subTest(sent=sent):
+                sock = self.raw_post_headers(f"/api/rooms/{room}/relay", 100, players[0]["token"])
+                sock.sendall(sent)
+                started = time.monotonic()
+                sock.settimeout(4)
+                try:
+                    data = sock.recv(4096)
+                except ConnectionResetError:
+                    data = b""
+                sock.close()
+                self.assertEqual(data, b"", "A stalled body gets no response; the connection closes")
+                self.assertLess(time.monotonic() - started, 3.5)
+                self.assertGreater(time.monotonic() - started, 0.7)
+
+    def test_seat_is_checked_before_the_body_is_read(self):
+        room, players = self.table("relay")
+        # No body follows, so an answer proves the server did not wait for it.
+        for path, token, status in ((f"/api/rooms/{room}/relay", "forged", 401),
+                                    ("/api/rooms/unknown-room-id-123456/relay", players[0]["token"], 404),
+                                    (f"/api/rooms/{room}/relay", None, 401)):
+            with self.subTest(path=path, token=token):
+                sock = self.raw_post_headers(path, 1024 * 1024, token)
+                sock.settimeout(2)
+                response = http.client.HTTPResponse(sock)
+                response.begin()
+                self.assertEqual(response.status, status)
+                response.close()
+                sock.close()
+        # Create and join take no token, so their bodies are capped at 4 KiB.
+        body = {"name": "Ada", "browser": "b0", "padding": "x" * 5000}
+        self.expect_error(self.request("/api/rooms", body), 413, "too_large")
+        self.expect_error(self.request(f"/api/rooms/{room}/join", body), 413, "too_large")
+
+    @server(env={"P2SKAT_TOTAL_BYTES": "6000"}, args=["--max-rooms", "2"])
+    def test_one_table_cannot_use_up_another_tables_share(self):
+        first, players = self.table("relay")
+        second, others = self.table("relay")
+        for seq in (1, 2):
+            self.assertEqual(self.relay(first, players[0], [{"to": 1, "seq": seq, "payload": payload(1000)}])[0], 200)
+        result = self.relay(first, players[0], [{"to": 1, "seq": 3, "payload": payload(1000)}])
+        self.expect_error(result, 429, "over_limit")
+        self.assertIn("This table ran out of message space", result[1]["error"])
+        for seq in (1, 2):
+            self.assertEqual(self.relay(second, others[0], [{"to": 1, "seq": seq, "payload": payload(1000)}])[0], 200)
+
+
+class RelayOnlyTests(ConformanceTest):
+    def check_relay_only(self):
+        for body in ({"name": "Ada", "browser": "b0"}, {"name": "Ada", "browser": "b0", "mode": "webrtc"}):
+            with self.subTest(body=body):
+                self.expect_error(self.request("/api/rooms", body), 400, "relay_only")
+        status, host = self.request("/api/rooms", {"name": "Ada", "browser": "b0", "mode": "relay"})
+        self.assertEqual((status, host["mode"]), (200, "relay"))
+
+    @server(args=["--relay-only"])
+    def test_relay_only_flag_refuses_webrtc_tables(self):
+        self.check_relay_only()
+
+    @server(env={"P2SKAT_RELAY_ONLY": "1"})
+    def test_relay_only_environment_refuses_webrtc_tables(self):
+        self.check_relay_only()
 
 
 class StaticTests(ConformanceTest):

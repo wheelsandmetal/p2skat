@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 WEB = Path(__file__).resolve().parents[1] / "web"
 MAX_SIGNAL = 64 * 1024
 MAX_BODY = MAX_SIGNAL * 2 + 4096
+MAX_JOIN_BODY = 4096  # create and join need no token, so their bodies stay small
 MAX_RELAY_BODY = 1024 * 1024 + 4096
 MAX_PAYLOAD = 64 * 1024 + 64
 MAX_SEQ = 2 ** 53 - 1
@@ -66,6 +67,11 @@ class Config:
         self.log_events = env_number(env, "P2SKAT_LOG_EVENTS", 256, int)
         self.log_bytes = env_number(env, "P2SKAT_LOG_BYTES", 1 << 20, int)
         self.total_bytes = env_number(env, "P2SKAT_TOTAL_BYTES", 16 << 20, int)
+        self.body_timeout = env_number(env, "P2SKAT_BODY_TIMEOUT_MS", 20_000) / 1000
+        relay_only = env.get("P2SKAT_RELAY_ONLY", "").strip()
+        if relay_only not in ("", "0", "1"):
+            raise ValueError("P2SKAT_RELAY_ONLY must be 0 or 1")
+        self.relay_only = relay_only == "1"
         # Fault injection (tests only): "MEAN" or "MEAN,JITTER" in ms, and seconds between drops.
         latency = env.get("P2SKAT_FAULT_LATENCY_MS", "")
         mean, _, jitter = latency.partition(",")
@@ -107,6 +113,7 @@ class Player:
         self.generation = 0     # incremented for every new stream
         self.stream = 0         # generation of the attached stream, 0 if none
         self.detached_since = time.monotonic()
+        self.last_seen = time.monotonic()  # last authenticated POST (the relay client's keepalive)
         self.drop_epoch = 0
         self.last_ready = 0.0
         self.tokens, self.refilled = float(config.burst), time.monotonic()
@@ -133,12 +140,15 @@ class Room:
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, *, config=None, max_rooms=MAX_ROOMS, web_dir=WEB, allowed_host=None):
+    def __init__(self, address, *, config=None, max_rooms=MAX_ROOMS, web_dir=WEB, allowed_host=None, relay_only=False):
         self.rooms = {}
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
         self.config = config or Config()
+        self.config.relay_only = self.config.relay_only or relay_only
         self.max_rooms, self.web_dir = max_rooms, str(web_dir)
+        # Each table's fair share of the total, so one table cannot crowd out the others.
+        self.room_cap = self.config.total_bytes // max(1, max_rooms)
         self.allowed_host = allowed_host.lower() if allowed_host else None
         self.total_bytes = 0
         self.stopping = threading.Event()
@@ -158,21 +168,24 @@ class Server(ThreadingHTTPServer):
         while player.log and player.log[0].id <= upto:
             self.discard(player)
 
-    def append(self, player, event, *, limited=True):
+    def append(self, player, event, others=None):
+        """`others`: bytes the rest of the table holds; None (the closed event) bypasses every limit."""
         data = json.dumps(event, separators=(",", ":"))
         size = len(data)
         config = self.config
 
         def over():
             return (len(player.log) >= config.log_events or player.log_bytes + size > config.log_bytes or
-                    self.total_bytes + size > config.total_bytes)
+                    others + player.log_bytes + size > self.room_cap or self.total_bytes + size > config.total_bytes)
 
-        if limited:
+        if others is not None:
             # Events already written to a stream go first; undelivered ones never do.
             while over() and player.log and player.log[0].id <= player.delivered:
                 player.lost = max(player.lost, self.discard(player).id)
             if len(player.log) >= config.log_events or player.log_bytes + size > config.log_bytes:
                 raise OverLimit(f"{player.name}’s connection fell too far behind. Create a new table.")
+            if others + player.log_bytes + size > self.room_cap:
+                raise OverLimit("This table ran out of message space. Create a new table.")
             if self.total_bytes + size > config.total_bytes:
                 raise OverLimit("The table server is out of message space. Create a new table.")
         now = time.monotonic()
@@ -193,7 +206,7 @@ class Server(ThreadingHTTPServer):
             while player.log:
                 self.discard(player)
             # The terminal event bypasses every limit.
-            self.append(player, {"type": "closed", "message": message}, limited=False)
+            self.append(player, {"type": "closed", "message": message})
         self.changed.notify_all()
 
     def delete(self, room_id):
@@ -214,8 +227,10 @@ class Server(ThreadingHTTPServer):
                 self.close(room, "This table expired. Create a new one.")
                 continue
             if room.mode == "relay":
+                # A frozen tab can keep its stream open, so its keepalive POSTs count too.
                 for player in room.players:
-                    if player.stream == 0 and now - player.detached_since > config.liveness:
+                    if ((player.stream == 0 and now - player.detached_since > config.liveness) or
+                            now - player.last_seen > config.liveness):
                         self.close(room, f"{player.name} lost connection.")
                         break
 
@@ -318,9 +333,27 @@ class Handler(SimpleHTTPRequestHandler):
             raise ApiError(415, "Send JSON")
         try:
             length = int(self.headers.get("Content-Length", "-1"))
-            if not 0 <= length <= limit:
-                raise ApiError(413, "Request is too large")
-            data = json.loads(self.rfile.read(length))
+        except ValueError:
+            raise ApiError(400, "Invalid JSON") from None
+        if not 0 <= length <= limit:
+            raise ApiError(413, "Request is too large")
+        # The whole body must arrive in time; a timeout (OSError) closes the connection.
+        deadline = time.monotonic() + self.server.config.body_timeout
+        raw = bytearray()
+        try:
+            while len(raw) < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("request body timed out")
+                self.connection.settimeout(remaining)
+                chunk = self.rfile.read1(length - len(raw))
+                if not chunk:
+                    raise ApiError(400, "Invalid JSON")
+                raw += chunk
+        finally:
+            self.connection.settimeout(15)
+        try:
+            data = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
             raise ApiError(400, "Invalid JSON") from None
         if not isinstance(data, dict):
@@ -371,8 +404,9 @@ class Handler(SimpleHTTPRequestHandler):
         return {"room": room.id, "seat": player.seat, "token": player.token, "players": room.roster(), "mode": room.mode}
 
     def emit(self, room, player, event):
+        others = sum(other.log_bytes for other in room.players if other is not player)
         try:
-            self.server.append(player, event)
+            self.server.append(player, event, others)
         except OverLimit as error:
             self.server.close(room, str(error))
             raise ApiError(429, str(error)) from None
@@ -492,7 +526,17 @@ class Handler(SimpleHTTPRequestHandler):
             self.check_host()
             self.origin()
             parts = urlsplit(self.path).path.strip("/").split("/")
-            body = self.body(MAX_RELAY_BODY if parts[-1:] == ["relay"] else MAX_BODY)
+            # Anyone may create or join with a small body; everything else needs a seat before
+            # its (up to 1 MiB) body is read or parsed.
+            if parts == ["api", "rooms"] or (len(parts) == 4 and parts[:2] == ["api", "rooms"] and parts[3] == "join"):
+                limit = MAX_JOIN_BODY
+            elif len(parts) == 4 and parts[:2] == ["api", "rooms"]:
+                with self.server.lock:
+                    self.player(self.room(parts[2]), self.bearer())
+                limit = MAX_RELAY_BODY if parts[3] == "relay" else MAX_BODY
+            else:
+                raise ApiError(404, "Unknown endpoint")
+            body = self.body(limit)
             with self.server.lock:
                 if parts == ["api", "rooms"]:
                     if not {"name", "browser"} <= set(body) <= {"name", "browser", "mode"}:
@@ -500,6 +544,8 @@ class Handler(SimpleHTTPRequestHandler):
                     mode = body.get("mode", "webrtc")
                     if mode not in ("webrtc", "relay"):
                         raise ApiError(400, "Mode must be webrtc or relay")
+                    if mode == "webrtc" and self.server.config.relay_only:
+                        raise ApiError(400, "This table server only hosts tables that route the game through it", "relay_only")
                     self.server.cleanup()
                     if len(self.server.rooms) >= self.server.max_rooms:
                         raise ApiError(503, "Too many tables. Try again later.")
@@ -512,6 +558,7 @@ class Handler(SimpleHTTPRequestHandler):
                         result = self.join(room, body)
                     else:
                         player = self.player(room, self.bearer())
+                        player.last_seen = time.monotonic()
                         epoch = player.drop_epoch
                         if parts[3] == "signal":
                             result = self.signal(room, player, body)
@@ -653,9 +700,11 @@ def main():
     parser.add_argument("--max-rooms", type=int, default=MAX_ROOMS)
     parser.add_argument("--web-dir", default=str(WEB))
     parser.add_argument("--allowed-host", help="only answer requests whose Host is this name")
+    parser.add_argument("--relay-only", action="store_true",
+                        help="refuse to create WebRTC tables (they have no liveness check)")
     args = parser.parse_args()
     with Server((args.host, args.port), max_rooms=args.max_rooms, web_dir=args.web_dir,
-                allowed_host=args.allowed_host) as server:
+                allowed_host=args.allowed_host, relay_only=args.relay_only) as server:
         print(f"p2skat: http://{args.host}:{server.server_port}", flush=True)
         try:
             server.serve_forever(poll_interval=0.1)

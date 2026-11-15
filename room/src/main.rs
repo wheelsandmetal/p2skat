@@ -21,9 +21,6 @@ use config::{Config, Options, USAGE};
 use http::Shared;
 use rooms::State;
 
-/// Router-sized: 8 tables × 3 players need a few dozen connections.
-const MAX_CONNECTIONS: usize = 256;
-
 fn main() {
     let options = match Options::parse(std::env::args().skip(1)) {
         Ok(Some(options)) => options,
@@ -36,10 +33,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let config = Config::from_env().unwrap_or_else(|error| {
+    let mut config = Config::from_env().unwrap_or_else(|error| {
         eprintln!("p2skat-room: {error}");
         std::process::exit(2);
     });
+    config.relay_only |= options.relay_only;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     if let Err(error) = runtime.block_on(serve(options, config)) {
         eprintln!("p2skat-room: {error}");
@@ -63,7 +61,9 @@ async fn serve(options: Options, config: Config) -> std::io::Result<()> {
         tokio::spawn(log_counts(shared.clone()));
     }
 
-    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // A player holds about three connections (events, uploads, keepalive); idle ones close
+    // after the 15 s header timeout. Connections over the cap are closed at once.
+    let connections = Arc::new(Semaphore::new(options.max_connections));
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(accepted) => accepted,

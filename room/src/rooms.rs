@@ -14,6 +14,8 @@ use crate::util::{self, Rng};
 
 pub const MAX_SIGNAL: usize = 64 * 1024;
 pub const MAX_BODY: usize = MAX_SIGNAL * 2 + 4096;
+/// Create and join need no token, so their bodies stay small.
+pub const MAX_JOIN_BODY: usize = 4096;
 pub const MAX_RELAY_BODY: usize = 1024 * 1024 + 4096;
 pub const MAX_PAYLOAD: usize = 64 * 1024 + 64;
 pub const MAX_SEQ: u64 = (1 << 53) - 1;
@@ -116,6 +118,8 @@ pub struct Player {
     /// Generation of the attached stream, 0 if none.
     pub stream: u64,
     pub detached_since: Instant,
+    /// Last authenticated POST (relay tables: the client's keepalive proves the tab still runs).
+    pub last_seen: Instant,
     pub drop_epoch: u64,
     last_ready: Instant,
     tokens: f64,
@@ -216,6 +220,8 @@ pub struct State {
 
 struct Logs<'a> {
     total: &'a mut usize,
+    /// Each table's fair share of `config.total_bytes`, so one table cannot crowd out the others.
+    room_cap: usize,
     config: &'a Config,
     rng: &'a mut Rng,
     now: Instant,
@@ -235,14 +241,17 @@ impl Logs<'_> {
         }
     }
 
-    fn append(&mut self, player: &mut Player, event: &Value, limited: bool) -> Result<(), String> {
+    /// `others`: bytes the rest of the table holds; None (the closed event) bypasses every limit.
+    fn append(&mut self, player: &mut Player, event: &Value, others: Option<usize>) -> Result<(), String> {
         let data = event.to_string();
         let size = data.len();
         let config = self.config;
-        if limited {
+        if let Some(others) = others {
+            let room_cap = self.room_cap;
             // Events already written to a stream go first; undelivered ones never do.
             while (player.log.len() >= config.log_events
                 || player.log_bytes + size > config.log_bytes
+                || others + player.log_bytes + size > room_cap
                 || *self.total + size > config.total_bytes)
                 && player.log.front().is_some_and(|event| event.id <= player.delivered)
             {
@@ -251,6 +260,9 @@ impl Logs<'_> {
             }
             if player.log.len() >= config.log_events || player.log_bytes + size > config.log_bytes {
                 return Err(format!("{}’s connection fell too far behind. Create a new table.", player.name));
+            }
+            if others + player.log_bytes + size > room_cap {
+                return Err("This table ran out of message space. Create a new table.".into());
             }
             if *self.total + size > config.total_bytes {
                 return Err("The table server is out of message space. Create a new table.".into());
@@ -281,13 +293,14 @@ impl Logs<'_> {
                 self.discard(player);
             }
             // The terminal event bypasses every limit.
-            let _ = self.append(player, &event, false);
+            let _ = self.append(player, &event, None);
         }
     }
 
     /// Append, closing the room if a limit is hit.
     fn emit(&mut self, room: &mut Room, to: usize, event: &Value) -> Result<(), ApiError> {
-        match self.append(&mut room.players[to], event, true) {
+        let others = room.players.iter().filter(|player| player.seat != to).map(|player| player.log_bytes).sum();
+        match self.append(&mut room.players[to], event, Some(others)) {
             Ok(()) => Ok(()),
             Err(message) => {
                 self.close(room, &message);
@@ -307,8 +320,9 @@ impl State {
     }
 
     fn split(&mut self, now: Instant) -> (&mut HashMap<String, Room>, Logs<'_>) {
-        let State { rooms, total_bytes, config, rng, .. } = self;
-        (rooms, Logs { total: total_bytes, config, rng, now })
+        let State { rooms, total_bytes, config, rng, max_rooms, .. } = self;
+        let room_cap = config.total_bytes / (*max_rooms).max(1);
+        (rooms, Logs { total: total_bytes, room_cap, config, rng, now })
     }
 
     pub fn cleanup(&mut self, now: Instant) -> bool {
@@ -330,10 +344,14 @@ impl State {
                 continue;
             }
             if room.mode == Mode::Relay {
+                // A frozen tab can keep its stream open, so its keepalive POSTs count too.
                 let lost = room
                     .players
                     .iter()
-                    .find(|player| player.stream == 0 && now.saturating_duration_since(player.detached_since) > config.liveness)
+                    .find(|player| {
+                        (player.stream == 0 && now.saturating_duration_since(player.detached_since) > config.liveness)
+                            || now.saturating_duration_since(player.last_seen) > config.liveness
+                    })
                     .map(|player| format!("{} lost connection.", player.name));
                 if let Some(message) = lost {
                     logs.close(room, &message);
@@ -389,6 +407,7 @@ impl State {
             generation: 0,
             stream: 0,
             detached_since: now,
+            last_seen: now,
             drop_epoch: 0,
             last_ready: now,
             tokens: self.config.burst,
@@ -407,6 +426,9 @@ impl State {
             return Err(bad("Supply your name and browser identifier"));
         }
         let mode = body.get("mode").map(Mode::parse).transpose()?.unwrap_or(Mode::WebRtc);
+        if mode == Mode::WebRtc && self.config.relay_only {
+            return Err(bad("This table server only hosts tables that route the game through it").code("relay_only"));
+        }
         self.cleanup(now);
         if self.rooms.len() >= self.max_rooms {
             return Err(ApiError::new(503, "Too many tables. Try again later."));
@@ -445,6 +467,7 @@ impl State {
                 *actor = Some(Actor { room: room_id.to_string(), seat, epoch: room.players[seat].drop_epoch });
                 let (rooms, mut logs) = self.split(now);
                 let room = rooms.get_mut(*room_id).expect("room exists");
+                room.players[seat].last_seen = now;
                 let result = match *action {
                     "signal" => signal(room, seat, body, &mut logs),
                     "relay" => relay(room, seat, body, &mut logs),
@@ -465,6 +488,15 @@ impl State {
             }
             _ => Err(ApiError::new(404, "Unknown endpoint")),
         }
+    }
+
+    /// Checked before a POST body is read: the table exists, is open, and the token holds a seat.
+    pub fn check_seat(&self, room_id: &str, token: &str) -> Result<(), ApiError> {
+        let room = self.rooms.get(room_id).ok_or_else(gone)?;
+        if room.closed {
+            return Err(gone().code("room_closed"));
+        }
+        room.authorize(token).map(|_| ())
     }
 
     pub fn open_stream(&mut self, room_id: &str, token: &str, after: u64, now: Instant) -> Result<StreamStart, ApiError> {
@@ -797,10 +829,45 @@ mod tests {
         table.relay(0, json!({"frames": [frame(1, 1), frame(1, 2), frame(1, 3)]})).unwrap();
         let error = table.relay(0, json!({"frames": [frame(1, 4)]})).unwrap_err();
         assert!(error.message.contains("too quickly"));
-        let mut table = Table::new("relay", Config { total_bytes: 150, ..Config::default() });
+    }
+
+    #[test]
+    fn one_table_cannot_use_up_another_tables_share() {
+        // Eight tables share 1200 bytes: 150 each.
+        let mut table = Table::new("relay", Config { total_bytes: 8 * 150, ..Config::default() });
         table.relay(0, json!({"frames": [frame(1, 1)]})).unwrap();
         let error = table.relay(0, json!({"frames": [frame(1, 2), frame(1, 3), frame(1, 4)]})).unwrap_err();
-        assert!(error.message.contains("out of message space"));
+        assert_eq!(error.code, "over_limit");
+        assert!(error.message.contains("This table ran out of message space"));
+        let host = table.state.post(&["api", "rooms"], "", &object(json!({"name": "Dora", "browser": "b", "mode": "relay"})), table.now).result.unwrap();
+        let room = host["room"].as_str().unwrap().to_owned();
+        table.state.post(&["api", "rooms", &room, "join"], "", &object(json!({"name": "Emil", "browser": "b"})), table.now).result.unwrap();
+        let frames = json!({"frames": [frame(1, 1), frame(1, 2)]});
+        let result = table.state.post(&["api", "rooms", &room, "relay"], host["token"].as_str().unwrap(), &object(frames), table.now).result;
+        assert_eq!(result.unwrap(), json!({"expected": {"1": 3}}));
+    }
+
+    #[test]
+    fn relay_only_refuses_webrtc_tables() {
+        let mut state = State::new(Config { relay_only: true, ..Config::default() }, 8);
+        let now = Instant::now();
+        for body in [json!({"name": "Ada", "browser": "b"}), json!({"name": "Ada", "browser": "b", "mode": "webrtc"})] {
+            let error = state.post(&["api", "rooms"], "", &object(body), now).result.unwrap_err();
+            assert_eq!((error.status, error.code), (400, "relay_only"));
+        }
+        assert!(state.rooms.is_empty());
+        state.post(&["api", "rooms"], "", &object(json!({"name": "Ada", "browser": "b", "mode": "relay"})), now).result.unwrap();
+    }
+
+    #[test]
+    fn seats_are_checked_before_bodies_are_read() {
+        let mut table = Table::new("relay", Config::default());
+        let room = table.room.clone();
+        assert!(table.state.check_seat(&room, &table.tokens[1]).is_ok());
+        assert_eq!(table.state.check_seat(&room, "forged").unwrap_err().code, "unauthorized");
+        assert_eq!(table.state.check_seat("unknown", &table.tokens[1]).unwrap_err().code, "not_found");
+        table.state.post(&["api", "rooms", &room, "leave"], &table.tokens[0].clone(), &Map::new(), table.now).result.unwrap();
+        assert_eq!(table.state.check_seat(&room, &table.tokens[1]).unwrap_err().code, "room_closed");
     }
 
     #[test]
@@ -826,5 +893,26 @@ mod tests {
         webrtc.state.cleanup(later);
         assert_eq!(relay.log(0), [json!({"type": "closed", "message": "Ada lost connection."})]);
         assert!(!webrtc.state.rooms[&webrtc.room].closed);
+    }
+
+    #[test]
+    fn an_open_stream_without_keepalive_posts_is_lost() {
+        let config = Config { liveness: Duration::from_secs(10), ..Config::default() };
+        let mut table = Table::new("relay", config);
+        let room = table.room.clone();
+        for seat in 0..3 {
+            table.state.open_stream(&room, &table.tokens[seat].clone(), 0, table.now).unwrap();
+        }
+        let start = table.now;
+        // Ada and Clara send ack-only keepalives every 4 s; Bert's frozen tab never posts.
+        for step in 1..=5 {
+            table.now = start + Duration::from_secs(4 * step);
+            table.state.cleanup(table.now);
+            assert_eq!(table.state.rooms[&room].closed, step >= 3, "step {step}");
+            for seat in [0, 2] {
+                assert_eq!(table.relay(seat, json!({"frames": []})).is_ok(), step < 3);
+            }
+        }
+        assert_eq!(table.log(0), [json!({"type": "closed", "message": "Bert lost connection."})]);
     }
 }

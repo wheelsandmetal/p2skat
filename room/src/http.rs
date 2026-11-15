@@ -13,10 +13,14 @@ use hyper::body::{Body as HttpBody, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderValue, CACHE_CONTROL, CONTENT_TYPE, HOST};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 
-use crate::rooms::{Actor, ApiError, State, Step, StreamState, MAX_BODY, MAX_RELAY_BODY, RETRY};
+use crate::rooms::{Actor, ApiError, State, Step, StreamState, MAX_BODY, MAX_JOIN_BODY, MAX_RELAY_BODY, RETRY};
 use crate::util;
+
+/// Request bodies being read at once may hold at most this many bytes in total,
+/// so many slow 1 MiB relay POSTs cannot exhaust a router's memory.
+const BODY_BUDGET: usize = 8 << 20;
 
 pub const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
@@ -70,12 +74,13 @@ pub struct Shared {
     changed: watch::Sender<u64>,
     web_dir: PathBuf,
     allowed_host: Option<String>,
+    body_budget: Semaphore,
     pub stats: Stats,
 }
 
 impl Shared {
     pub fn new(state: State, web_dir: PathBuf, allowed_host: Option<String>) -> Shared {
-        Shared { state: Mutex::new(state), changed: watch::channel(0).0, web_dir, allowed_host, stats: Stats::default() }
+        Shared { state: Mutex::new(state), changed: watch::channel(0).0, web_dir, allowed_host, body_budget: Semaphore::new(BODY_BUDGET), stats: Stats::default() }
     }
 
     pub fn lock(&self) -> MutexGuard<'_, State> {
@@ -149,32 +154,56 @@ pub async fn handle(shared: Arc<Shared>, request: Request<Incoming>) -> Result<R
     }
 }
 
-async fn read_body(request: Request<Incoming>, limit: usize) -> Result<Value, ApiError> {
+enum BodyError {
+    Api(ApiError),
+    /// The body did not arrive in time: close the connection without a response.
+    Timeout,
+}
+
+impl From<ApiError> for BodyError {
+    fn from(error: ApiError) -> BodyError {
+        BodyError::Api(error)
+    }
+}
+
+async fn read_body(shared: &Shared, request: Request<Incoming>, limit: usize) -> Result<Value, BodyError> {
     let content_type = header(&request, CONTENT_TYPE).unwrap_or("text/plain");
     if !content_type.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json") {
-        return Err(ApiError::new(415, "Send JSON"));
+        return Err(ApiError::new(415, "Send JSON").into());
     }
     let length = match header(&request, "content-length") {
-        None => return Err(ApiError::new(413, "Request is too large")),
+        None => return Err(ApiError::new(413, "Request is too large").into()),
         Some(text) => text.trim().parse::<usize>().map_err(|_| ApiError::new(400, "Invalid JSON"))?,
     };
     if length > limit {
-        return Err(ApiError::new(413, "Request is too large"));
+        return Err(ApiError::new(413, "Request is too large").into());
     }
+    let Ok(_budget) = shared.body_budget.try_acquire_many(length as u32) else {
+        return Err(ApiError::new(503, "The table server is busy. Try again.").into());
+    };
+    let timeout = shared.lock().config.body_timeout;
     let mut body = request.into_body();
-    let mut data = Vec::with_capacity(length);
-    while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
-        let frame = frame.map_err(|_| ApiError::new(400, "Invalid JSON"))?;
-        if let Ok(chunk) = frame.into_data() {
-            if data.len() + chunk.len() > limit {
-                return Err(ApiError::new(413, "Request is too large"));
+    // Grows with what actually arrives; a Content-Length alone reserves nothing.
+    let mut data = Vec::with_capacity(length.min(64 * 1024));
+    let read = async {
+        while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+            let frame = frame.map_err(|_| ApiError::new(400, "Invalid JSON"))?;
+            if let Ok(chunk) = frame.into_data() {
+                if data.len() + chunk.len() > limit {
+                    return Err(ApiError::new(413, "Request is too large"));
+                }
+                data.extend_from_slice(&chunk);
             }
-            data.extend_from_slice(&chunk);
         }
+        Ok(())
+    };
+    match tokio::time::timeout(timeout, read).await {
+        Ok(result) => result?,
+        Err(_) => return Err(BodyError::Timeout),
     }
     let value: Value = serde_json::from_slice(&data).map_err(|_| ApiError::new(400, "Invalid JSON"))?;
     if !value.is_object() {
-        return Err(ApiError::new(400, "Expected a JSON object"));
+        return Err(ApiError::new(400, "Expected a JSON object").into());
     }
     Ok(value)
 }
@@ -184,8 +213,18 @@ async fn post(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Respons
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     let token = header(&request, "authorization").and_then(|value| value.strip_prefix("Bearer ")).unwrap_or("").to_owned();
     let allowed = origin_allowed(header(&request, "origin"), header(&request, HOST), header(&request, "sec-fetch-site"));
-    let limit = if parts.last() == Some(&"relay") { MAX_RELAY_BODY } else { MAX_BODY };
-    let body = if allowed { read_body(request, limit).await } else { Err(ApiError::new(403, "Requests must come from this website")) };
+    // Anyone may create or join with a small body; everything else needs a seat before its
+    // (up to 1 MiB) body is read or parsed.
+    let checked = match parts[..] {
+        _ if !allowed => Err(ApiError::new(403, "Requests must come from this website")),
+        ["api", "rooms"] | ["api", "rooms", _, "join"] => Ok(MAX_JOIN_BODY),
+        ["api", "rooms", room_id, action] => shared.lock().check_seat(room_id, &token).map(|()| if action == "relay" { MAX_RELAY_BODY } else { MAX_BODY }),
+        _ => Err(ApiError::new(404, "Unknown endpoint")),
+    };
+    let body = match checked {
+        Ok(limit) => read_body(&shared, request, limit).await,
+        Err(error) => Err(error.into()),
+    };
     let (result, actor, delay) = match body {
         Ok(Value::Object(body)) => {
             let outcome = shared.lock().post(&parts, &token, &body, Instant::now());
@@ -193,7 +232,8 @@ async fn post(shared: Arc<Shared>, request: Request<Incoming>) -> Result<Respons
             (outcome.result, outcome.actor, outcome.delay)
         }
         Ok(_) => unreachable!("read_body returns objects"),
-        Err(error) => {
+        Err(BodyError::Timeout) => return Err(Abort),
+        Err(BodyError::Api(error)) => {
             let delay = {
                 let mut state = shared.lock();
                 let State { config, rng, .. } = &mut *state;
