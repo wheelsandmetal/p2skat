@@ -484,14 +484,23 @@ impl TerminalUi {
         self.legal_cards = None;
         self.skat_selected.clear();
 
-        let options = [
-            ("Clubs", "\u{2663}", "12"),
-            ("Spades", "\u{2660}", "11"),
-            ("Hearts", "\u{2665}", "10"),
-            ("Diamonds", "\u{2666}", "9"),
-            ("Grand", "", "24"),
-            ("Null", "", "23"),
+        let modifiers = crate::game::contract::Modifiers {
+            hand: is_hand,
+            ..Default::default()
+        };
+        let null_value = crate::game::scoring::null_value(modifiers);
+        let null_label = null_value.to_string();
+        let mut options = vec![
+            ("Clubs", "\u{2663}", "12", GameType::Suit(Suit::Clubs)),
+            ("Spades", "\u{2660}", "11", GameType::Suit(Suit::Spades)),
+            ("Hearts", "\u{2665}", "10", GameType::Suit(Suit::Hearts)),
+            ("Diamonds", "\u{2666}", "9", GameType::Suit(Suit::Diamonds)),
+            ("Grand", "", "24", GameType::Grand),
         ];
+        // Null has a fixed value, so it cannot be declared once the bid exceeds it.
+        if null_value >= bid {
+            options.push(("Null", "", null_label.as_str(), GameType::Null));
+        }
         let mut menu_cursor = 0usize;
 
         loop {
@@ -502,7 +511,7 @@ impl TerminalUi {
             ))];
             self.action_lines.push(Line::from(""));
 
-            for (i, (name, symbol, base)) in options.iter().enumerate() {
+            for (i, (name, symbol, base, _)) in options.iter().enumerate() {
                 let marker = if i == menu_cursor { "> " } else { "  " };
                 let style = if i == menu_cursor {
                     Style::default().add_modifier(Modifier::REVERSED)
@@ -529,22 +538,7 @@ impl TerminalUi {
                     KeyCode::Up if menu_cursor > 0 => menu_cursor -= 1,
                     KeyCode::Down if menu_cursor < options.len() - 1 => menu_cursor += 1,
                     KeyCode::Enter => {
-                        let game_type = match menu_cursor {
-                            0 => GameType::Suit(Suit::Clubs),
-                            1 => GameType::Suit(Suit::Spades),
-                            2 => GameType::Suit(Suit::Hearts),
-                            3 => GameType::Suit(Suit::Diamonds),
-                            4 => GameType::Grand,
-                            5 => GameType::Null,
-                            _ => unreachable!(),
-                        };
-
-                        let modifiers = crate::game::contract::Modifiers {
-                            hand: is_hand,
-                            ..Default::default()
-                        };
-
-                        return Ok(Contract::new(game_type, modifiers));
+                        return Ok(Contract::new(options[menu_cursor].3, modifiers));
                     }
                     _ => {}
                 }

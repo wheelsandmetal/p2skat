@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#143e35">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#102b25">
   <title>p2skat · A table for three</title>
   <link rel="stylesheet" href="style.css">
   <script type="module" src="app.js"></script>
@@ -11,20 +11,33 @@
 <body>
   <header class="masthead">
     <a href="./" class="brand" aria-label="p2skat home"><span aria-hidden="true">♠</span> p2skat</a>
-    <span class="tagline">A table for three.</span>
-    <button id="leave" class="quiet" hidden>Leave table</button>
+    <span class="tagline">A TABLE FOR THREE</span>
+    <div class="header-actions">
+      <button id="leave" class="quiet" hidden>Leave table</button>
+      <button id="fullscreen" class="icon-button quiet" aria-label="Enter full screen" title="Enter full screen" hidden><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg></button>
+    </div>
   </header>
   <main>
     <section id="setup" class="setup-panel" aria-labelledby="setup-heading">
-      <div class="intro"><span class="eyebrow">THE BROWSER TABLE · PROTOTYPE</span><h1 id="setup-heading">Good cards.<br>Better company.</h1><p>Bring two friends. Shuffle the deck, bid together, and play a full game of Skat in your browsers.</p></div>
+      <div class="intro">
+        <span class="eyebrow">THE NEXT ROUND IS YOURS</span>
+        <h1 id="setup-heading">A seat at<br>the table.</h1>
+        <p>Three friends. Thirty-two cards. Skat.</p>
+        <div class="showcase" aria-hidden="true">
+          <div class="card"><span class="rank">A</span><span class="suit">♣</span><span class="rank-end">A</span></div>
+          <div class="card red"><span class="rank">J</span><span class="suit">♥</span><span class="rank-end">J</span></div>
+          <div class="card"><span class="rank">A</span><span class="suit">♠</span><span class="rank-end">A</span></div>
+        </div>
+      </div>
       <div class="setup-card">
         <form id="room-form">
-          <h2 id="room-heading">Set your table</h2>
-          <p id="room-intro" class="hint">Create a table and send the invite to two friends. We’ll handle the connections.</p>
-          <label>Your name<input id="player-name" maxlength="40" required autocomplete="nickname" placeholder="What should we call you?"></label>
+          <span class="eyebrow">PULL UP A CHAIR</span>
+          <h2 id="room-heading">Let’s play.</h2>
+          <p id="room-intro" class="hint">Create a table. Invite two friends.</p>
+          <label>Your name<input id="player-name" maxlength="40" required autocomplete="nickname" placeholder="Name at the table"></label>
           <div class="action-buttons room-buttons"><button id="create-table" type="submit" class="primary">Create table <span aria-hidden="true">↗</span></button><button id="join-table" type="button" class="primary" hidden>Join table <span aria-hidden="true">↗</span></button></div>
         </form>
-        <details class="network-settings"><summary>Network settings · STUN &amp; TURN</summary>
+        <details class="network-settings"><summary>Network settings</summary>
           <div class="setup-grid">
             <label>STUN URL<input id="stun" value="stun:stun.l.google.com:19302" spellcheck="false" autocomplete="off"></label>
             <label>TURN URL <span class="optional">optional</span><input id="turn-url" placeholder="turn:relay.example.com:3478" spellcheck="false" autocomplete="off"></label>
@@ -32,52 +45,53 @@
             <label>Temporary TURN password<input id="turn-credential" type="password" autocomplete="off"></label>
           </div>
           <label class="checkbox"><input id="relay-only" type="checkbox"> Use TURN relay only</label>
-          <p class="hint">Use temporary client credentials from your TURN provider. Never enter a server admin password or signing secret.</p>
+          <p class="hint">Use temporary TURN credentials. Never enter an admin password or signing secret.</p>
         </details>
-        <p class="privacy">Direct connections can reveal your IP address to the other players. This browser version does not provide Tor anonymity. Some networks need TURN to connect; without a working relay, setup may fail.</p>
-        <details id="manual-setup"><summary>Advanced · manual connection setup</summary>
+        <details id="manual-setup"><summary>Advanced</summary>
           <form id="setup-form">
-            <h2>Connect manually</h2>
-            <p class="hint">For static hosting without an invite service. Choose a different seat on each device. Enter the same three names, in the same order, everywhere.</p>
+            <h2>Manual connection</h2>
+            <p class="hint">Choose different seats. Use the same three names, in the same order, on every device.</p>
             <div class="setup-grid">
-              <label>Your seat<select id="seat"><option value="0">Seat 1 · first forehand</option><option value="1">Seat 2 · first middlehand</option><option value="2">Seat 3 · first rearhand</option></select></label>
+              <label>Your seat<select id="seat"><option value="0">Seat 1 · forehand</option><option value="1">Seat 2 · middlehand</option><option value="2">Seat 3 · rearhand</option></select></label>
               <label>Seat 1 name<input id="name-0" value="Player 1" maxlength="40" required autocomplete="off"></label>
               <label>Seat 2 name<input id="name-1" value="Player 2" maxlength="40" required autocomplete="off"></label>
               <label>Seat 3 name<input id="name-2" value="Player 3" maxlength="40" required autocomplete="off"></label>
             </div>
-            <button id="prepare" type="submit" class="primary">Prepare connections <span aria-hidden="true">↗</span></button>
+            <button id="prepare" type="submit" class="primary">Connect <span aria-hidden="true">↗</span></button>
           </form>
+          <section class="self-check" aria-label="Browser check"><button id="self-check">Run crypto self-check</button><p id="self-check-result" role="status" aria-live="polite"></p></section>
         </details>
+        <p class="privacy">Direct peers can see your IP. No Tor anonymity. Some networks need a working TURN relay to connect.</p>
       </div>
     </section>
 
     <section id="room-lobby" class="room-lobby" aria-labelledby="lobby-heading" hidden>
-      <div><span class="eyebrow">A SEAT FOR EVERYONE</span><h1 id="lobby-heading">Your friends are invited.</h1><p>Share this link with two friends, or open two player tabs to try the table on this browser. The game starts when everyone joins.</p></div>
-      <div class="invite-panel"><label>Table invite<input id="invite-link" readonly spellcheck="false"></label><div class="action-buttons"><button id="copy-invite">Copy invite</button><a id="open-player-tab" class="button-link" target="_blank" rel="noopener">Open another player tab</a></div><ol id="room-players" aria-label="Players at your table" aria-live="polite"></ol><p id="room-progress" class="hint">Waiting for the table to fill.</p></div>
+      <div><span class="eyebrow">THE TABLE IS OPEN</span><h1 id="lobby-heading">Save them<br>a seat.</h1><p>Send the invite to two friends. We’ll deal when everyone’s here.</p><div class="lobby-suits" aria-hidden="true">♣ <span>♥</span> ♠</div></div>
+      <div class="invite-panel"><label>Table invite<input id="invite-link" readonly spellcheck="false"></label><div class="action-buttons"><button id="copy-invite" class="primary">Copy invite</button><a id="open-player-tab" class="button-link" target="_blank" rel="noopener">Open player tab ↗</a></div><ol id="room-players" aria-label="Players at your table" aria-live="polite"></ol><p id="room-progress" class="hint">Waiting for friends…</p></div>
     </section>
 
     <section id="connections" class="connection-panel" aria-labelledby="connections-heading" hidden>
-      <div><span class="eyebrow">THREE PLAYERS · THREE CONNECTIONS</span><h1 id="connections-heading">Bring everyone to the table.</h1><p>Exchange details for each pairing using a trusted private channel. Offers come from the lower-numbered seat; answers go back. The game starts automatically when all three connections are ready.</p></div>
+      <div><span class="eyebrow">MANUAL CONNECTION</span><h1 id="connections-heading">Connect your table.</h1><p>Exchange details privately. Lower seats send offers; higher seats send answers. Play starts when everyone connects.</p></div>
       <div id="peer-connections" class="peer-grid"></div>
     </section>
 
-    <div class="status-bar" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="connection-state">Your next round starts here.</span></div>
-
     <section id="game" aria-label="Skat table" hidden>
-      <div class="table-heading"><div><span class="eyebrow">YOUR TABLE</span><h1>Make your play.</h1></div><div class="round-badge"><span id="round">Round —</span><span id="trick-num">Trick — / 10</span></div></div>
+      <div class="table-heading"><span class="eyebrow">THE TABLE</span><div class="round-badge"><span id="round">Round —</span><span id="trick-num">Trick — / 10</span></div></div>
       <div class="table-layout">
         <div class="felt">
           <div id="players" class="players"></div>
-          <div class="table-meta"><span id="contract">Waiting for the deal</span><strong id="turn" role="status" aria-live="polite">Preparing the deck</strong></div>
-          <div id="trick" class="trick" aria-label="Current trick"><p class="empty-trick">The cards will meet here.</p></div>
-          <div class="hand-area"><div class="hand-label"><h2>Your hand</h2><span id="hand-hint">Your cards stay on this device during play.</span></div><div id="hand" class="hand" aria-label="Your cards"></div></div>
+          <div class="table-meta"><span id="contract">Dealing</span><strong id="turn" role="status" aria-live="polite">Shuffling…</strong></div>
+          <div id="trick" class="trick" aria-label="Current trick"><p class="empty-trick" role="img" aria-label="No cards played">♠</p></div>
+          <div class="hand-area"><div class="hand-label"><h2>Your hand</h2><span id="hand-hint">Waiting for the deal</span></div><div id="hand" class="hand" aria-label="Your cards"></div></div>
         </div>
-        <aside class="game-sidebar"><section class="action-panel"><span class="eyebrow">AT THE TABLE</span><h2 id="prompt-heading">Shuffling &amp; dealing</h2><p id="game-status">Fresh keys, a fresh deck.</p><div id="actions"></div></section><section class="activity-panel"><h2>Table notes</h2><ol id="activity" aria-label="Recent game events"></ol></section></aside>
+        <aside class="game-sidebar">
+          <section class="action-panel"><div class="action-copy"><h2 id="prompt-heading">Dealing</h2><p id="game-status">Shuffling…</p></div><div id="actions"></div></section>
+          <details class="activity-panel"><summary>Table notes</summary><ol id="activity" aria-label="Recent game events" aria-live="polite"></ol></details>
+        </aside>
       </div>
     </section>
-
-    <section class="self-check"><div><h2>Check your browser</h2><p>Run the real 2048-bit shuffle, deal, and verification on this device. Crypto runs in a worker so the table stays responsive.</p></div><div><button id="self-check">Run crypto self-check</button><p id="self-check-result" role="status" aria-live="polite"></p></div></section>
+    <div class="status-bar" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="connection-state">Ready when you are.</span></div>
   </main>
-  <footer><span>♠ &nbsp; p2skat</span><p>Three players. One shared game. No accounts.</p><p>Prototype · card secrecy and cheating resistance are not guaranteed.</p></footer>
+  <footer><span>NO ACCOUNTS. JUST CARDS.</span><p>Prototype · card secrecy and cheating resistance are not guaranteed.</p></footer>
 </body>
 </html>

@@ -46,7 +46,7 @@ event streams. The default address is local to this computer. `--host` and
 `--port` select a different listening address; this script does not configure
 public hosting, HTTPS, or a TURN provider.
 
-**Advanced · manual connection setup** remains available for static-only hosting.
+**Advanced → Manual connection** remains available for static-only hosting.
 Choose different seats and the same names on each device, then exchange the
 offers and answers for pairs 1–2, 1–3, and 2–3.
 

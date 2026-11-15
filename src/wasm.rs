@@ -21,6 +21,7 @@ use crate::{
         bidding::BidAction,
         card::{Card, Suit},
         contract::{Contract, GameType, Modifiers},
+        scoring::null_value,
         trick::Trick,
     },
     net::message::Message,
@@ -419,7 +420,12 @@ impl Frontend for BrowserUi {
         let action = self
             .choice(
                 "contract",
-                json!({"hand":cards(hand),"bid":bid,"is_hand":is_hand}),
+                json!({
+                    "hand": cards(hand),
+                    "bid": bid,
+                    "is_hand": is_hand,
+                    "null_allowed": null_value(Modifiers { hand: is_hand, ..Modifiers::default() }) >= bid,
+                }),
             )
             .await?;
         let game_type = match action["game_type"].as_str() {

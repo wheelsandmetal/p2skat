@@ -92,6 +92,19 @@ $('self-check').addEventListener('click', () => {
 });
 
 $('leave').addEventListener('click', () => stop('You left the table. The other players have been notified.'));
+const fullscreen = $('fullscreen');
+fullscreen.hidden = !document.fullscreenEnabled;
+fullscreen.addEventListener('click', async () => {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+  } catch { status('Full screen is unavailable in this browser.', true); }
+});
+document.addEventListener('fullscreenchange', () => {
+  const label = document.fullscreenElement ? 'Exit full screen' : 'Enter full screen';
+  fullscreen.setAttribute('aria-label', label);
+  fullscreen.title = label;
+});
 window.addEventListener('pagehide', () => { mesh?.close(); room?.close().catch(() => {}); worker?.terminate(); });
 
 function networkConfiguration() {
@@ -114,7 +127,7 @@ function startMesh(configuration, localPeers = []) {
       }
     },
     onStatus: (remote, text) => {
-      if (room) $('room-progress').textContent = 'Connecting everyone to the table…';
+      if (room) $('room-progress').textContent = 'Connecting…';
       else peerPanels.get(remote).detail.textContent = text;
     },
     onMessage: (seat, json) => incoming.push(seat, json),
@@ -124,7 +137,7 @@ function startMesh(configuration, localPeers = []) {
       $('room-lobby').hidden = true;
       $('game').hidden = false;
       $('self-check').disabled = true;
-      status('All three players connected. Starting game…');
+      status('3 players connected');
       renderPlayers();
       const gameWorker = getWorker();
       gameWorker.postMessage({ type: 'start', config: { seat: ui.seat, names: ui.names } });
@@ -145,11 +158,11 @@ function showRoomPlayers(players, configuration, marker) {
   $('room-players').replaceChildren(...[0, 1, 2].map(seat => {
     const player = players.find(player => player.seat === seat);
     const item = element('li', `room-player${player ? ' present' : ''}`);
-    item.append(element('span', 'room-seat', `${seat + 1}`), element('span', '', player ? `${player.name}${seat === ui.seat ? ' (you)' : ''}` : 'Waiting for a friend…'));
+    item.append(element('span', 'room-seat', `${seat + 1}`), element('span', '', player ? `${player.name}${seat === ui.seat ? ' (you)' : ''}` : 'Open seat'));
     return item;
   }));
   if (players.length < 3) {
-    $('room-progress').textContent = `${players.length} of 3 players here. Share your invite to fill the table.`;
+    $('room-progress').textContent = `${players.length} / 3 at the table`;
     return;
   }
   const names = validateNames(players.map(player => player.name));
@@ -158,7 +171,7 @@ function showRoomPlayers(players, configuration, marker) {
     return;
   }
   ui.names = names;
-  $('room-progress').textContent = 'Everyone is here. Connecting your table…';
+  $('room-progress').textContent = 'Everyone’s here. Connecting…';
   const localPeers = typeof BroadcastChannel === 'function' && configuration.iceTransportPolicy !== 'relay'
     ? players.filter(player => player.seat !== ui.seat && player.browser === marker).map(player => player.seat) : [];
   roomMeshReady = startMesh(configuration, localPeers);
@@ -170,10 +183,10 @@ let invitedRoom;
 function updateInvite() {
   if (room || mesh) return;
   invitedRoom = new URLSearchParams(location.hash.slice(1)).get('room');
-  $('room-heading').textContent = invitedRoom ? 'Your seat is waiting' : 'Set your table';
+  $('room-heading').textContent = invitedRoom ? 'Take your seat.' : 'Let’s play.';
   $('room-intro').textContent = invitedRoom
-    ? 'Enter your name and join your friends. We’ll connect the table automatically.'
-    : 'Create a table and send the invite to two friends. We’ll handle the connections.';
+    ? 'Your friends are waiting.'
+    : 'Create a table. Invite two friends.';
   $('create-table').hidden = Boolean(invitedRoom);
   $('join-table').hidden = !invitedRoom;
 }
@@ -349,14 +362,14 @@ function renderHand() {
         if (ui.selected.has(id)) ui.selected.delete(id);
         else if (ui.selected.size < 2) ui.selected.add(id);
         renderHand();
-        $('discard-count').textContent = `${ui.selected.size} of 2 cards selected`;
+        $('discard-count').textContent = `${ui.selected.size} / 2 selected`;
         $('discard-submit').disabled = ui.selected.size !== 2;
         $('hand').querySelector(`[data-card="${id}"]`).focus();
       });
     } else if (legal) card.addEventListener('click', () => submit({ card: id }));
     return card;
   }));
-  $('hand-hint').textContent = ui.choice?.kind === 'discard' ? 'Choose two cards to return to the skat.' : ui.choice?.kind === 'card' ? 'Highlighted cards are legal to play.' : 'Your cards stay on this device during play.';
+  $('hand-hint').textContent = ui.choice?.kind === 'discard' ? 'Choose two to discard' : ui.choice?.kind === 'card' ? 'Gold marks playable cards' : '';
 }
 
 function renderTrick(cards) {
@@ -365,7 +378,12 @@ function renderTrick(cards) {
     play.append(element('span', '', ui.names[seat]), cardNode(card));
     return play;
   }));
-  if (!cards.length) $('trick').append(element('p', 'empty-trick', 'The cards will meet here.'));
+  if (!cards.length) {
+    const empty = element('p', 'empty-trick', '♠');
+    empty.setAttribute('role', 'img');
+    empty.setAttribute('aria-label', 'No cards played');
+    $('trick').append(empty);
+  }
 }
 
 function renderContract(contract) {
@@ -379,8 +397,8 @@ function submit(action) {
   ui.selected.clear();
   $('actions').replaceChildren();
   $('actions').removeAttribute('data-kind');
-  $('prompt-heading').textContent = 'Around the table';
-  $('game-status').textContent = 'Waiting for the other players…';
+  $('prompt-heading').textContent = 'At the table';
+  $('game-status').textContent = 'Waiting for the others…';
   renderHand();
   worker.postMessage({ type: 'action', json: JSON.stringify({ ...action, id }) });
 }
@@ -400,26 +418,26 @@ function renderChoice(choice) {
   if (choice.contract) renderContract(choice.contract);
   if (choice.trick_num) $('trick-num').textContent = `Trick ${choice.trick_num} / 10`;
   ui.turn = choice.kind === 'continue' ? null : ui.seat;
-  $('turn').textContent = choice.kind === 'continue' ? 'Waiting for round agreement' : 'Your turn';
+  $('turn').textContent = choice.kind === 'continue' ? 'Round complete' : 'Your turn';
   renderPlayers();
   const actions = $('actions');
   actions.replaceChildren();
   actions.dataset.kind = choice.kind;
   const buttons = element('div', 'action-buttons');
   if (choice.kind === 'bid') {
-    $('prompt-heading').textContent = 'Make your bid';
+    $('prompt-heading').textContent = 'Your bid';
     $('game-status').textContent = choice.is_responder ? 'Hold the bid or pass.' : 'Raise the bid or pass.';
     if (choice.is_responder) buttons.append(actionButton('Hold', 'hold', { action: 'hold' }, true));
     else if (choice.next_bid !== null) buttons.append(actionButton(`Bid ${choice.next_bid}`, 'bid', { action: 'bid' }, true));
     buttons.append(actionButton('Pass', 'pass', { action: 'pass' }));
   } else if (choice.kind === 'pickup') {
-    $('prompt-heading').textContent = 'The skat is yours';
-    $('game-status').textContent = 'Pick up the two hidden cards, or play a hand game with your original ten.';
+    $('prompt-heading').textContent = 'Skat or hand?';
+    $('game-status').textContent = 'Take two cards, or keep your ten.';
     buttons.append(actionButton('Pick up skat', 'pickup', { pickup: true }, true), actionButton('Play hand', 'hand', { pickup: false }));
   } else if (choice.kind === 'discard') {
-    $('prompt-heading').textContent = 'Choose your two';
-    $('game-status').textContent = 'Select exactly two cards from your hand to put into the skat.';
-    const count = element('p', 'selected-cards', '0 of 2 cards selected');
+    $('prompt-heading').textContent = 'Discard two';
+    $('game-status').textContent = 'Select two cards for the skat.';
+    const count = element('p', 'selected-cards', '0 / 2 selected');
     count.id = 'discard-count';
     count.setAttribute('role', 'status');
     const button = element('button', 'primary', 'Discard selected');
@@ -430,12 +448,15 @@ function renderChoice(choice) {
     actions.append(count, button);
   } else if (choice.kind === 'contract') {
     $('prompt-heading').textContent = 'Name your game';
-    $('game-status').textContent = `Winning bid: ${choice.bid}. ${choice.is_hand ? 'You are playing hand.' : 'The skat is settled.'}`;
+    $('game-status').textContent = `Bid ${choice.bid}${choice.is_hand ? ' · Hand' : ''}`;
     const form = element('form');
     const label = element('label', '', 'Game');
     const type = element('select');
     type.id = 'contract-type';
-    for (const [value, text] of [['suit', 'Suit game'], ['grand', 'Grand · jacks are trumps'], ['null', 'Null · take no tricks']]) {
+    const games = [['suit', 'Suit game'], ['grand', 'Grand · jacks are trumps']];
+    // Null has a fixed value; the game core rejects it when the bid is higher.
+    if (choice.null_allowed) games.push(['null', 'Null · take no tricks']);
+    for (const [value, text] of games) {
       const option = element('option', '', text);
       option.value = value;
       type.append(option);
@@ -451,7 +472,7 @@ function renderChoice(choice) {
     }
     trumpLabel.append(trump);
     type.addEventListener('change', () => { trumpLabel.hidden = type.value !== 'suit'; });
-    const declare = element('button', 'primary', 'Declare contract');
+    const declare = element('button', 'primary', 'Declare');
     declare.type = 'submit';
     declare.dataset.action = 'declare';
     form.append(label, trumpLabel, declare);
@@ -461,11 +482,11 @@ function renderChoice(choice) {
     });
     actions.append(form);
   } else if (choice.kind === 'card') {
-    $('prompt-heading').textContent = 'Your card to play';
-    $('game-status').textContent = 'Choose a highlighted card in your hand. Follow suit when you can.';
+    $('prompt-heading').textContent = 'Play a card';
+    $('game-status').textContent = 'Follow suit when you can.';
   } else if (choice.kind === 'continue') {
     $('prompt-heading').textContent = 'Another round?';
-    $('game-status').textContent = 'The next round starts when everyone agrees. Each round uses fresh keys.';
+    $('game-status').textContent = 'Everyone agrees to deal again.';
     buttons.append(actionButton('Next round', 'continue', { continue: true }, true), actionButton('Finish game', 'finish', { continue: false }));
   } else throw new Error('Unknown game choice.');
   if (buttons.children.length) actions.append(buttons);
@@ -488,7 +509,7 @@ function renderEvent(event) {
   else if (event.type === 'trick_num') $('trick-num').textContent = `Trick ${event.number} / 10`;
   else if (event.type === 'round') {
     $('round').textContent = `Round ${event.number}`;
-    $('contract').textContent = 'Waiting for the deal';
+    $('contract').textContent = 'Dealing';
     $('trick-num').textContent = 'Trick — / 10';
     ui.hand = [];
     ui.turn = null;
@@ -498,7 +519,7 @@ function renderEvent(event) {
     note(`Round ${event.number} · a fresh deck.`);
   } else if (event.type === 'status') {
     $('game-status').textContent = event.message;
-    if (!ui.choice) $('prompt-heading').textContent = 'Around the table';
+    if (!ui.choice) $('prompt-heading').textContent = 'At the table';
     note(event.message);
   } else if (event.type === 'bid') {
     note(`${event.name} ${event.action === 'bid' ? `bids ${event.value}` : event.action === 'hold' ? 'holds' : 'passes'}.`);

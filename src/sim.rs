@@ -105,6 +105,7 @@ pub fn run(config: &SimConfig) -> Result<(), String> {
             total_declarer_points,
             declarer_trick_count,
             10,
+            bid_value,
         );
         scoreboard.record(declarer, value, bid_value);
 

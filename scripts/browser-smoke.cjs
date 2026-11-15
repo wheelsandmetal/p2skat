@@ -53,6 +53,15 @@ async function main() {
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'Setup overflows viewport');
     }
 
+    if (await pages[0].locator('#fullscreen').isVisible()) {
+      await pages[0].bringToFront();
+      await pages[0].locator('#fullscreen').click();
+      await pages[0].waitForFunction(() => Boolean(document.fullscreenElement));
+      assert.equal(await pages[0].locator('#fullscreen').getAttribute('aria-label'), 'Exit full screen');
+      await pages[0].locator('#fullscreen').click();
+      await pages[0].waitForFunction(() => !document.fullscreenElement);
+    }
+    await pages[0].locator('#manual-setup summary').click();
     await pages[0].locator('#self-check').click();
     const responsiveness = await pages[0].evaluate(async () => {
       const start = performance.now();
@@ -62,6 +71,7 @@ async function main() {
     assert.ok(responsiveness < 2000, 'Crypto blocked the main thread');
     await pages[0].waitForFunction(() => /passed|verified|success/i.test(document.querySelector('#self-check-result').textContent), undefined, { timeout: 120000 });
     console.log('Crypto:', await pages[0].locator('#self-check-result').textContent());
+    await pages[0].locator('#manual-setup summary').click();
 
     let invite;
     for (let seat = 0; seat < 3; seat++) {
@@ -122,6 +132,7 @@ async function main() {
     }
 
     const handled = [0, 0, 0];
+    const checkedLayouts = new Set();
     let verifiedRounds = 0;
     const deadline = Date.now() + 180000;
     while (verifiedRounds < 2 && Date.now() < deadline) {
@@ -145,6 +156,11 @@ async function main() {
         if (!choice || choice.id <= handled[seat]) continue;
         const page = pages[seat];
         const action = name => page.locator(`[data-action="${name}"]`);
+        const layoutKey = `${seat}:${choice.kind}`;
+        if (!checkedLayouts.has(layoutKey)) {
+          assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth || document.documentElement.scrollHeight > innerHeight + 1), false, `${layoutKey} does not fit the screen`);
+          checkedLayouts.add(layoutKey);
+        }
         if (choice.kind === 'continue') {
           if (round !== 1 || verifiedRounds < 1) continue;
           if (seat === 2) {
@@ -160,15 +176,21 @@ async function main() {
         } else if (choice.kind === 'pickup') {
           await action(round === 1 ? 'pickup' : 'hand').click();
         } else if (choice.kind === 'discard') {
-          await page.locator('#hand [data-card]').nth(0).click();
-          await page.locator('#hand [data-card]').nth(1).click();
+          const viewport = page.viewportSize();
+          await page.setViewportSize({ width: 390, height: 844 });
+          assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth || document.documentElement.scrollHeight > innerHeight + 1), false, 'Twelve-card mobile hand does not fit the screen');
+          await page.locator('#hand [data-card]').nth(0).click({ position: { x: 10, y: 15 } });
+          await page.locator('#hand [data-card]').nth(1).click({ position: { x: 10, y: 15 } });
+          await page.screenshot({ path: '/tmp/p2skat-discard-mobile.png', fullPage: true });
           await action('discard').click();
+          await page.setViewportSize(viewport);
         } else if (choice.kind === 'contract') {
           await page.locator('#contract-type').selectOption(round === 1 ? 'grand' : 'null');
           await action('declare').click();
         } else if (choice.kind === 'card') {
           assert.match(await page.locator('#turn').textContent(), /your turn/i);
-          await page.locator('#hand [data-card]:not(:disabled)').first().click();
+          if (round === 1 && choice.trick_num === 1) await page.screenshot({ path: `/tmp/p2skat-playing-${seat}.png`, fullPage: true });
+          await page.locator('#hand [data-card]:not(:disabled)').first().click({ position: { x: 10, y: 15 } });
         } else throw new Error(`Unknown choice ${choice.kind}`);
         handled[seat] = choice.id;
       }

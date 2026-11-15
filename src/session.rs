@@ -8,7 +8,7 @@ use crate::crypto::sra::SraKeyPair;
 use crate::game::bidding::{BidAction, BiddingState, Seat};
 use crate::game::card::Card;
 use crate::game::contract::{Contract, GameType, Modifiers};
-use crate::game::scoring::{count_points, game_value, ScoreBoard};
+use crate::game::scoring::{count_points, game_value, null_value, ScoreBoard};
 use crate::game::state::{GameState, Phase};
 use crate::game::trick::{legal_plays, Trick};
 use crate::net::message::Message;
@@ -239,7 +239,7 @@ impl<T: Transport> Session<T> {
             let declarer_seat = state.declarer.unwrap();
             let declarer_idx = declarer_seat.index();
 
-            let (value, decl_points) = score_revealed_hand(&state, &revealed_deck)?;
+            let (value, decl_points) = score_revealed_hand(&state, &revealed_deck, final_bid)?;
             verify_plays(&revealed_deck, &plays, &contract, declarer_idx)?;
 
             score_board.record(declarer_idx, value, final_bid);
@@ -566,7 +566,7 @@ impl<T: Transport> Session<T> {
                 let contract = self
                     .input(ui.declare_contract(&state.hand, bid, false))
                     .await?;
-                validate_contract(&contract, false)?;
+                validate_contract(&contract, false, bid)?;
 
                 let msg = Message::Declaration {
                     game_type: game_type_to_msg(contract.game_type),
@@ -584,7 +584,7 @@ impl<T: Transport> Session<T> {
                 let contract = self
                     .input(ui.declare_contract(&state.hand, bid, true))
                     .await?;
-                validate_contract(&contract, true)?;
+                validate_contract(&contract, true, bid)?;
 
                 let msg = Message::Declaration {
                     game_type: game_type_to_msg(contract.game_type),
@@ -665,7 +665,7 @@ impl<T: Transport> Session<T> {
                                 ouvert,
                             },
                         );
-                        validate_contract(&contract, !picked_up)?;
+                        validate_contract(&contract, !picked_up, bid)?;
                         ui.show_status(&format!(
                             "{} declares {:?}{}",
                             self.names[declarer.index()],
@@ -837,7 +837,7 @@ fn verify_plays(
     Ok(())
 }
 
-fn score_revealed_hand(state: &GameState, deck: &[Card]) -> Result<(i32, u32)> {
+fn score_revealed_hand(state: &GameState, deck: &[Card], bid: u32) -> Result<(i32, u32)> {
     anyhow::ensure!(deck.len() == 32, "Expected 32 revealed cards");
     let declarer = state
         .declarer
@@ -883,6 +883,7 @@ fn score_revealed_hand(state: &GameState, deck: &[Card]) -> Result<(i32, u32)> {
         points,
         (won_cards.len() / 3) as u32,
         10,
+        bid,
     );
     Ok((value, points))
 }
@@ -957,7 +958,7 @@ fn ensure_unique_cards(cards: &[Card]) -> Result<()> {
     Ok(())
 }
 
-fn validate_contract(contract: &Contract, hand: bool) -> Result<()> {
+fn validate_contract(contract: &Contract, hand: bool, bid: u32) -> Result<()> {
     let modifiers = contract.modifiers;
     anyhow::ensure!(
         modifiers.hand == hand,
@@ -970,6 +971,11 @@ fn validate_contract(contract: &Contract, hand: bool) -> Result<()> {
     anyhow::ensure!(
         !modifiers.schwarz_announced || modifiers.schneider_announced,
         "Schwarz announcement requires Schneider"
+    );
+    // Null has a fixed value, so a Null below the bid is known to be overbid before play.
+    anyhow::ensure!(
+        contract.game_type != GameType::Null || null_value(modifiers) >= bid,
+        "Null is worth less than the bid"
     );
     Ok(())
 }
@@ -1059,7 +1065,7 @@ mod scoring_tests {
         for my_seat in 0..3 {
             let (state, deck) = revealed_round(false, my_seat);
             // CJ and SJ were discarded: still with two, despite winning neither jack.
-            assert_eq!(score_revealed_hand(&state, &deck).unwrap(), (72, 68));
+            assert_eq!(score_revealed_hand(&state, &deck, 18).unwrap(), (72, 68));
         }
     }
 
@@ -1068,7 +1074,7 @@ mod scoring_tests {
         for my_seat in 0..3 {
             let (state, deck) = revealed_round(true, my_seat);
             // Twenty unseen skat points lift the declarer from 44 to 64.
-            assert_eq!(score_revealed_hand(&state, &deck).unwrap(), (96, 64));
+            assert_eq!(score_revealed_hand(&state, &deck, 18).unwrap(), (96, 64));
         }
     }
 
@@ -1076,18 +1082,46 @@ mod scoring_tests {
     fn scoring_rejects_duplicate_or_missing_played_cards() {
         let (mut state, deck) = revealed_round(false, 1);
         state.tricks_won[1][0] = state.tricks_won[0][0];
-        assert!(score_revealed_hand(&state, &deck).is_err());
+        assert!(score_revealed_hand(&state, &deck, 18).is_err());
 
         let (mut state, deck) = revealed_round(false, 1);
         state.tricks_won[1].truncate(9);
-        assert!(score_revealed_hand(&state, &deck).is_err());
+        assert!(score_revealed_hand(&state, &deck, 18).is_err());
+    }
+
+    #[test]
+    fn peers_score_overbid_and_lost_games_identically() {
+        for my_seat in 0..3 {
+            // Grand with 2 is worth 72: overbid at 77, so lost at 4 * 24, doubled.
+            let (state, deck) = revealed_round(false, my_seat);
+            assert_eq!(score_revealed_hand(&state, &deck, 77).unwrap(), (-192, 68));
+        }
+    }
+
+    #[test]
+    fn null_below_the_bid_cannot_be_declared() {
+        let null = |hand| {
+            Contract::new(
+                GameType::Null,
+                Modifiers {
+                    hand,
+                    ..Modifiers::default()
+                },
+            )
+        };
+        assert!(validate_contract(&null(false), false, 23).is_ok());
+        assert!(validate_contract(&null(false), false, 24).is_err());
+        assert!(validate_contract(&null(true), true, 35).is_ok());
+        assert!(validate_contract(&null(true), true, 36).is_err());
+        let grand = Contract::new(GameType::Grand, Modifiers::default());
+        assert!(validate_contract(&grand, false, 264).is_ok());
     }
 
     #[test]
     fn scoring_rejects_playing_the_skat_in_a_hand_game() {
         let (mut state, deck) = revealed_round(true, 1);
         state.tricks_won[0][4] = deck[30];
-        assert!(score_revealed_hand(&state, &deck).is_err());
+        assert!(score_revealed_hand(&state, &deck, 18).is_err());
     }
 }
 
