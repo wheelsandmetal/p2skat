@@ -9,11 +9,18 @@ const SERVER_HINT = 'Start the table server (cargo run --release -p p2skat-room,
 export const WATCHDOG_MS = 25000;
 const RECONNECT_MS = 2000;
 const GIVE_UP_MS = 150000;
+// Relay tables only: the server closes a table when a player sends no POST for 120 s (a frozen
+// tab can keep its stream open). Without other uploads, an ack-only POST goes out this often.
+export const KEEPALIVE_MS = 30000;
+export const RESTARTED_MESSAGE = 'The table server restarted or closed the table.';
+
+// Names are limited in code points, as the server counts them (not UTF-16 units).
+export const nameLength = name => [...name].length;
 
 export function validatePlayers(players) {
   if (!Array.isArray(players) || players.length < 1 || players.length > 3 ||
       players.some(player => !player || !Number.isInteger(player.seat) || player.seat < 0 || player.seat > 2 ||
-        typeof player.name !== 'string' || !player.name.trim() || player.name.length > 40 ||
+        typeof player.name !== 'string' || !player.name.trim() || nameLength(player.name) > 40 ||
         typeof player.browser !== 'string' || !player.browser || player.browser.length > 48) ||
       new Set(players.map(player => player.seat)).size !== players.length) {
     throw new Error('The table service sent an invalid player list.');
@@ -73,7 +80,7 @@ async function request(path, body, token, fetcher) {
 export class RoomClient {
   // `mode` is what this client intends. The server's answer is checked, not trusted: a relay
   // player never falls back to WebRTC (which would reveal its IP address to the other players).
-  static async enter({ room, name, browser, mode, fetcher = globalThis.fetch, EventSourceClass = globalThis.EventSource, timers }) {
+  static async enter({ room, name, browser, mode, fetcher = globalThis.fetch, EventSourceClass = globalThis.EventSource, timers, keepaliveMs }) {
     if (room && !ROOM_ID.test(room)) throw new Error('This invite link is invalid.');
     if (mode !== undefined && !MODES.includes(mode)) throw new Error('Unknown table mode.');
     const path = room ? `/api/rooms/${encodeURIComponent(room)}/join` : '/api/rooms';
@@ -89,15 +96,18 @@ export class RoomClient {
     if (!data.players.some(player => player.seat === data.seat && player.name === name && player.browser === browser)) {
       throw new Error('The table service returned a seat belonging to another player.');
     }
-    return new RoomClient(data, fetcher, EventSourceClass, timers);
+    return new RoomClient(data, fetcher, EventSourceClass, timers, keepaliveMs);
   }
 
-  constructor(data, fetcher, EventSourceClass, timers = globalThis) {
+  constructor(data, fetcher, EventSourceClass, timers = globalThis, keepaliveMs = KEEPALIVE_MS) {
     Object.assign(this, data);
     this.fetcher = fetcher;
     this.EventSourceClass = EventSourceClass;
     this.timers = timers;
+    this.keepaliveMs = keepaliveMs;
     this.now = () => Date.now();
+    this.lastPost = this.now(); // joining was a POST
+    this.probing = false;
     this.closed = false;
     this.source = null;
     this.lastEventId = 0;
@@ -146,6 +156,8 @@ export class RoomClient {
       // CONNECTING means EventSource retries by itself with Last-Event-ID; CLOSED means it gave up.
       if (this.closed || source !== this.source || source.readyState !== 2) return;
       this.lostSince ??= this.now();
+      // EventSource does not expose the status; a 404 or 401 means the table is gone for good.
+      void this.probe();
       if (!this.reconnectTimer) {
         this.reconnectTimer = this.timers.setTimeout(() => { this.reconnectTimer = null; this.connect(); }, RECONNECT_MS);
       }
@@ -179,10 +191,24 @@ export class RoomClient {
     const now = this.now();
     if (this.lostSince !== null && now - this.lostSince > GIVE_UP_MS) {
       this.fail(new Error('Lost contact with the table server. The table has ended.'));
+      return;
     } else if (now - this.lastActivity > WATCHDOG_MS) {
       this.lostSince ??= this.lastActivity;
       this.connect();
     }
+    if (now - this.lastPost >= this.keepaliveMs) void this.probe();
+  }
+
+  // An ack-only relay POST: the server's liveness keepalive, and a probe that tells a table the
+  // server forgot (it restarted, or the closed table expired) from a network problem.
+  async probe() {
+    if (this.closed || this.probing) return;
+    this.probing = true;
+    try {
+      const { status, data } = await this.sendFrames({ frames: [], ack: this.lastEventId });
+      if (status === 401 || (status === 404 && data?.code === 'not_found')) this.fail(new Error(RESTARTED_MESSAGE));
+    } catch { /* Network trouble: the stream watchdog and the uploader decide. */ }
+    finally { this.probing = false; }
   }
 
   fail(error) {
@@ -195,6 +221,7 @@ export class RoomClient {
   async sendFrames(body, signal) {
     if (this.closed) throw new Error('This table has ended.');
     const fetcher = this.fetcher; // native fetch throws when called as a method of another object
+    this.lastPost = this.now();
     const response = await fetcher(`/api/rooms/${encodeURIComponent(this.room)}/relay`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` },
       body: JSON.stringify(body), signal,

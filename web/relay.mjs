@@ -7,6 +7,7 @@
 // Receivers check the order themselves: duplicates are dropped, a gap or a failed
 // integrity check ends the table. See docs/plans/tor-onion-relay.md, Phase 2.
 import { checkText, validateNames } from './transport.mjs';
+import { RESTARTED_MESSAGE } from './rooms.mjs';
 
 export const RELAY_PROTOCOL = 'p2skat-relay-v1';
 export const TAMPERED_MESSAGE = 'This invite link was tampered with or is for another table.';
@@ -101,7 +102,7 @@ export async function verifyKeyFrame(subtle, authKey, payload, expected) {
       typeof frame.room_id !== 'string' || frame.room_id.length > 128 ||
       typeof frame.mode !== 'string' || frame.mode.length > 16 ||
       !Array.isArray(frame.names) || frame.names.length !== 3 ||
-      frame.names.some(name => typeof name !== 'string' || name.length > 40) ||
+      frame.names.some(name => typeof name !== 'string' || [...name].length > 40) ||
       !pub || pub.length !== 65 || pub[0] !== 4 || !mac || mac.length !== 32) {
     throw new Error(TAMPERED_MESSAGE);
   }
@@ -242,7 +243,9 @@ export class RelayUploader {
       if (status >= 500 || (status === 200 && !data) || status === undefined) return this.retry();
       if (status === 404 && (data?.code === 'room_closed' || data?.code === 'not_found')) {
         // The table closed; its `closed` event usually explains why, so give it a moment to arrive.
-        this.timer = this.timers.setTimeout(() => this.fail(new Error('This table has ended.')), this.closedGraceMs);
+        // A table the server does not know at all (it restarted) never sends one.
+        const message = data.code === 'not_found' ? RESTARTED_MESSAGE : 'This table has ended.';
+        this.timer = this.timers.setTimeout(() => this.fail(new Error(message)), this.closedGraceMs);
         return;
       }
       throw new Error(typeof data?.error === 'string' && data.error.length <= 400 ? data.error : 'The table server rejected a message.');

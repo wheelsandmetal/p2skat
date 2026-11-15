@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RoomClient, browserMarker, parseRoomEvent, validatePlayers } from './rooms.mjs';
+import { validateNames } from './transport.mjs';
 
 const roomId = 'unguessable-room-id';
 const token = 'unguessable-seat-token';
 const players = [{ seat: 0, name: 'Ada', browser: 'browser-identifier-1' }];
+const settleMicrotasks = () => new Promise(resolve => setTimeout(resolve, 0));
 const response = (data, status = 200, type = 'application/json') => ({
   ok: status < 400, status, headers: { get: () => type }, json: async () => data,
 });
@@ -195,4 +197,64 @@ test('relay frames are posted with the seat token and an abort signal, and API e
   assert.equal(requests[0].options.headers.Authorization, `Bearer ${token}`);
   assert.equal(requests[0].options.signal, controller.signal);
   assert.deepEqual(JSON.parse(requests[0].options.body), { frames: [{ to: 1, seq: 3, payload: 'AAAA' }], ack: 4 });
+});
+
+test('names are limited to 40 code points, as the server counts them', () => {
+  const emoji = '\u{1F0CF}'; // one code point, two UTF-16 units
+  assert.equal(validatePlayers([{ ...players[0], name: emoji.repeat(40) }])[0].name, emoji.repeat(40));
+  assert.throws(() => validatePlayers([{ ...players[0], name: emoji.repeat(41) }]), /invalid player/);
+  assert.deepEqual(validateNames([emoji.repeat(40), 'Bert', 'Clara']), [emoji.repeat(40), 'Bert', 'Clara']);
+  assert.throws(() => validateNames([emoji.repeat(41), 'Bert', 'Clara']), /1–40 characters/);
+});
+
+test('a relay seat sends ack-only keepalives when nothing else was posted for a while', async () => {
+  FakeEventSource.instances = [];
+  const timers = new FakeTimers();
+  const posts = [];
+  const fetcher = async (path, options) => { posts.push({ path, body: JSON.parse(options.body) }); return response({ expected: {} }); };
+  const client = new RoomClient({ room: roomId, token, seat: 0, mode: 'relay' }, fetcher, FakeEventSource, timers, 30000);
+  let clock = 0;
+  client.now = () => clock;
+  client.lastPost = 0;
+  client.listen(() => {}, assert.fail);
+  FakeEventSource.instances[0].onmessage({ data: JSON.stringify({ type: 'relay', from: 1, seq: 1, payload: 'AAAA' }), lastEventId: '5' });
+  clock = 29000;
+  timers.run();
+  assert.equal(posts.length, 0);
+  clock = 30000;
+  timers.run();
+  await settleMicrotasks();
+  assert.deepEqual(posts, [{ path: `/api/rooms/${roomId}/relay`, body: { frames: [], ack: 5 } }]);
+  // Uploads count as keepalives too.
+  clock = 50000;
+  await client.sendFrames({ frames: [{ to: 1, seq: 2, payload: 'AAAA' }], ack: 5 });
+  clock = 79000;
+  timers.run();
+  await settleMicrotasks();
+  assert.equal(posts.length, 2);
+  clock = 80000;
+  timers.run();
+  await settleMicrotasks();
+  assert.equal(posts.length, 3);
+  client.disconnectEvents();
+});
+
+test('after a server restart the relay stream fails at once instead of retrying for minutes', async () => {
+  for (const [status, code, fails] of [[404, 'not_found', true], [401, 'unauthorized', true], [404, 'room_closed', false], [0, 'network', false]]) {
+    FakeEventSource.instances = [];
+    const timers = new FakeTimers();
+    const fetcher = async () => {
+      if (status === 0) throw new TypeError('Failed to fetch');
+      return response({ error: 'gone', code }, status);
+    };
+    const client = new RoomClient({ room: roomId, token, seat: 0, mode: 'relay' }, fetcher, FakeEventSource, timers);
+    const errors = [];
+    client.listen(() => {}, error => errors.push(error.message));
+    const source = FakeEventSource.instances[0];
+    source.readyState = 2; // EventSource gave up: the server answered with an error status
+    source.onerror();
+    await settleMicrotasks();
+    assert.deepEqual(errors, fails ? ['The table server restarted or closed the table.'] : [], `${status} ${code}`);
+    client.disconnectEvents();
+  }
 });

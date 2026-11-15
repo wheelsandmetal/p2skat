@@ -12,7 +12,7 @@ export function checkText(text, limit = MAX_MESSAGE_BYTES) {
 
 export function validateNames(names) {
   if (!Array.isArray(names) || names.length !== 3 || names.some(name =>
-    typeof name !== 'string' || !name.trim() || name.length > 40)) {
+    typeof name !== 'string' || !name.trim() || [...name].length > 40)) {
     throw new Error('Enter a name of 1–40 characters for each player.');
   }
   return names;

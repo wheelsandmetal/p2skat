@@ -121,6 +121,8 @@ const relayReason = typeof window.RTCPeerConnection !== 'function'
     ? 'This page is served over Tor, so the game goes through the table server, end-to-end encrypted, and no direct connections reveal your IP address. STUN and TURN are not used.'
     : null;
 const viaTor = relayReason !== null;
+// Tests that run the server with a short P2SKAT_LIVENESS_MS shorten the relay keepalive to match.
+const keepaliveMs = Number.isFinite(window.P2SKAT_KEEPALIVE_MS) && window.P2SKAT_KEEPALIVE_MS > 0 ? window.P2SKAT_KEEPALIVE_MS : undefined;
 const shuffleText = viaTor ? 'Shuffling over Tor, this can take half a minute…' : 'Shuffling through the table server…';
 
 function readInvite() {
@@ -282,8 +284,13 @@ async function enterRoom() {
     const marker = mode === 'webrtc' && typeof BroadcastChannel === 'function' && configuration.iceTransportPolicy !== 'relay'
       ? browserMarker() : crypto.randomUUID();
     try {
-      room = await RoomClient.enter({ room: invitedRoom, name, browser: marker, mode });
+      room = await RoomClient.enter({ room: invitedRoom, name, browser: marker, mode, keepaliveMs });
     } catch (error) {
+      if (error.code === 'relay_only') {
+        $('relay-mode').checked = true;
+        updateNetworkUi();
+        throw new Error('This table server only hosts tables that route the game through it. That option is now on: create the table again.');
+      }
       if (error.code !== 'wrong_mode') throw error;
       throw new Error(mode === 'relay'
         ? 'This table uses direct WebRTC connections, which this browser cannot or should not make. Ask for a table that routes the game through the table server.'

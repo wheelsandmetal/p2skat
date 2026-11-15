@@ -417,6 +417,13 @@ test('terminal server errors end the table with the server message; a closed tab
   assert.deepEqual(later, []);
   await waitFor(() => later.length);
   assert.deepEqual(later, ['This table has ended.']);
+  const third = manualPost();
+  const forgotten = [];
+  const unknown = new RelayUploader({ lingerMs: 0, post: third.post, onFatal: error => forgotten.push(error.message), closedGraceMs: 1 });
+  unknown.enqueue(frame(1, 1));
+  third.calls[0].resolve({ status: 404, data: { error: 'This table ended or expired', code: 'not_found' } });
+  await waitFor(() => forgotten.length);
+  assert.deepEqual(forgotten, ['The table server restarted or closed the table.']);
 });
 
 test('idle time before a failed POST is no outage; only a long run of failures is fatal', async () => {

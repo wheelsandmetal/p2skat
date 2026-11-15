@@ -4,7 +4,8 @@
 // so the game runs over the table server's encrypted relay. TEST_DEADLINE_S raises the two-round
 // deadline (default 180 s) for fault-injected servers. TEST_LIVENESS_MS tells the test that the
 // server runs with that P2SKAT_LIVENESS_MS: closing a tab without a leave request must then end the
-// game for the others with "lost connection".
+// game for the others with "lost connection". It also shortens the pages' relay keepalive (normally
+// 30 s against the server's 120 s window) to a quarter of that window.
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
 const { chromium } = require('playwright-core');
@@ -14,6 +15,7 @@ const relay = args.includes('--relay') || process.env.TEST_RELAY === '1';
 const url = args.find(arg => !arg.startsWith('--')) || 'http://localhost:8765';
 const deadlineMs = Number(process.env.TEST_DEADLINE_S || 180) * 1000;
 const livenessMs = Number(process.env.TEST_LIVENESS_MS || 0);
+const keepaliveMs = livenessMs ? Math.max(500, Math.floor(livenessMs / 4)) : 0;
 const PLAINTEXT_MARKERS = ['"type":"game"', '"type":"hello"', '"type":"ready"', '"type":"bye"', '"body"', '"version"', 'hello', 'Bert', 'Clara'];
 
 // Acceptance check: every relay payload any page sent (POST bodies) or received (SSE) must be
@@ -67,7 +69,8 @@ async function main() {
       page.setDefaultTimeout(60000);
       page.on('pageerror', error => errors.push(`Seat ${seat}: ${error.message}`));
       if (process.env.TEST_CONSOLE) page.on('console', message => console.log(`[seat ${seat}] ${message.text()}`));
-      await page.addInitScript(relayMode => {
+      await page.addInitScript(({ relayMode, keepaliveMs }) => {
+        if (keepaliveMs) window.P2SKAT_KEEPALIVE_MS = keepaliveMs;
         window.testEvents = [];
         window.testFailures = [];
         window.testConnections = [];
@@ -113,7 +116,7 @@ async function main() {
             });
           }
         };
-      }, relay);
+      }, { relayMode: relay, keepaliveMs });
       await page.goto(url);
       pages.push(page);
       assert.deepEqual(await page.evaluate(() => {
