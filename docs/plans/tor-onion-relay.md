@@ -498,6 +498,80 @@ uses (`label`, `ordered`, `maxRetransmits`, `maxPacketLifeTime`, `readyState`,
 - Manual: three real Tor Browsers on separate devices against the
   router.
 
+#### Phase 2–4 results (2026-11-15)
+
+Implemented as specified in `web/relay.mjs` (`RelaySession`, `RelayChannel`,
+`RelayUploader`), `web/rooms.mjs`, `web/transport.mjs` (`relayPeers`) and
+`web/app.js`. Choices the plan left open:
+
+- **Key frame encoding.** The payload is base64url JSON
+  `{type, from, to, room_id, mode, names, pub, mac}` (`pub` = raw uncompressed
+  P-256 point, `mac` = HMAC-SHA256, both base64url). The MAC input is
+  `canonical("p2skat-relay-v1", "key", from, to, room_id, mode, "3", name0,
+  name1, name2, pub)`, each part a 4-byte big-endian length plus UTF-8 (or raw)
+  bytes. Structure errors, a bad MAC and any mismatch of `from` (server-stamped),
+  `to`, room, names or `mode != "relay"` all fail with the same message.
+- **Direction keys.** `dir` in the HKDF info is `"<from>><to>"`; `pub_lo` /
+  `pub_hi` are the base64url public keys. The nonce tag is the bytes
+  `0x70 0x32 from to`.
+- **Uploader.** Frames stay queued until a 200 `expected` confirms them; a 200
+  that doesn't confirm a frame it carried is fatal. A 422 `gap` skips the frames
+  the server says it has and resends from there; if that doesn't line up with
+  the queue (the server lost a confirmed frame) it's fatal. Network errors,
+  aborts (30 s) and 5xx retry with backoff (250 ms … 8 s) for up to 120 s since
+  the last success; 404 `room_closed` waits 3 s for the stream's `closed`
+  reason; every other error ends the table with the server's text. Batches
+  hold ≤ 32 frames. An idle uploader **lingers 15 ms** (not in hidden tabs) so
+  a burst such as the deck to both peers shares one POST: under the latency
+  fault this cut POSTs per seat from ~60 to ~37 and a round from ~64–70 s to
+  ~47–57 s. An ack-only POST goes out after 32 unacknowledged events.
+- **Stream.** Relay rooms only: logged events at or below the last id are
+  dropped (the `lastEventId` buffer persists across id-less `players`/`ping`
+  events, so only `relay`/`closed` are checked). A 1 s timer reopens the stream
+  with `?after=` after 25 s without any event; an `EventSource` that reached
+  `CLOSED` is reopened after 2 s; after 150 s without a working stream the
+  table ends. WebRTC rooms keep the old one-shot behaviour.
+- `bye` is never delivered in relay mode (the session closes before it's
+  encrypted). Peers learn from `closed` after `leave`, or from liveness.
+
+Tests: 25 `node --test` cases in `web/relay.test.mjs` (plus 4 relay cases in
+`web/rooms.test.mjs`); 47 in total pass. Acceptance 4 is checked in the
+`--relay` smoke run: the page wraps `fetch` and `EventSource`, and every
+payload any seat posted or received (≈ 200 per run) must be one of the 6 key
+frames or non-JSON ciphertext without packet markers.
+
+`browser-smoke.cjs --relay`, headless Chromium, three isolated profiles,
+`RTCPeerConnection` deleted, two full rounds, then one tab closes with its
+`leave` blocked (`P2SKAT_LIVENESS_MS` 8000 or 10000). Deal = `round` →
+`hand` event, slowest seat; the crypto alone is ≈ 3 s here.
+
+| Server, faults | Deal (r1 / r2) | Round (r1 / r2) | Tab closed → others told |
+|---|---|---|---|
+| Rust | 3.3 / 3.3 s | 14.0 / 13.2 s | 8.1 s |
+| serve.py | 3.3 / 3.3 s | 14.0 / 13.3 s | 20.8 s |
+| Rust, latency 800±400 | 13.7 / 14.2 s | 56.8 / 53.0 s | 11.0 s |
+| serve.py, latency 800±400 | 13.8 / 13.2 s | 55.2 / 46.8 s | 26.2 s |
+| Rust, drop every 15 s | 3.0 / 3.1 s | 9.4 / 8.5 s | 10.0 s |
+| serve.py, drop every 15 s | 3.0 / 3.1 s | 9.3 / 8.7 s | 12.9 s |
+| Rust, latency + drop every 8 s | 8.9 / 8.6 s | 49.1 / 42.0 s | 11.3 s |
+| WebRTC (`TEST_WEBRTC=1`), for comparison | 3.1 / 3.4 s | 14.8 / 12.2 s | — |
+
+Notes:
+
+- Under latency the mesh was ready ~4–5 s after the last join (key frame,
+  `hello`, `ready`: three hops).
+- Drops cut 1–12 streams per run; `EventSource`'s own `Last-Event-ID`
+  reconnect resumed every one, so the manual reconnect path ran only in unit
+  tests. No relay POST ever failed at the page: Chromium transparently resends
+  a POST whose reused connection closes before the response. The retry path is
+  covered by unit tests.
+- serve.py notices a vanished stream only at its next heartbeat write, so its
+  liveness timeout fires up to 10 s late. Within the plan's "within 120 s".
+- A deal under injected latency (~14 s) is mostly the hop chain plus the one
+  POST in flight: seat 2 sends four messages during hop 3, and the later ones
+  wait for the earlier POST's (delayed) response. Real Tor should land between
+  this and the 3 s local figure.
+
 ### Phase 5: deployment on the router
 
 Target: OpenWrt 24.10 (`opkg`), `aarch64_cortex-a53`.

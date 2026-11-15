@@ -2,8 +2,10 @@
 
 Three-player peer-to-peer Skat, with a native terminal app and a browser frontend.
 Both frontends use the same Rust game session, rules, scoring, and card crypto.
-The browser frontend uses WebRTC between devices and local channels between
-tabs in the same browser. The native app uses TCP or Tor.
+The browser frontend uses WebRTC between devices, local channels between
+tabs in the same browser, or an end-to-end encrypted relay through the table
+server for Tor Browser (see [Play over Tor](#play-over-tor-relay-mode)). The
+native app uses TCP or Tor.
 
 ## Build and run the browser app
 
@@ -36,8 +38,8 @@ and works the same way. Reload existing tabs after switching servers.
    Everyone must agree to continue before the next round starts. Leaving or
    losing a connection ends the session; reload to prepare a new game.
 
-The server exchanges connection details, never cards or private keys. Established
-games can keep running if the signaling connection drops. Rooms live in memory,
+In WebRTC mode the server exchanges connection details, never cards or private
+keys, and established games keep running if the signaling connection drops. Rooms live in memory,
 allow three players, and expire after an hour without activity. Restarting the
 server loses its rooms; create a new table to invite new players.
 
@@ -62,8 +64,8 @@ screenshots when credentials are present.
 
 Game processing and private keys stay on each player's device, with keys
 revealed by the protocol after a completed round. WebRTC encrypts transport;
-direct peers can learn each other's network addresses. This browser mode does
-not preserve Tor anonymity. The custom card protocol (SRA mental poker) is
+direct peers can learn each other's network addresses. WebRTC mode does not
+preserve Tor anonymity; relay mode (below) does. The custom card protocol (SRA mental poker) is
 unaudited. Cards are encoded as hash-derived quadratic residues, so ciphertexts
 no longer show a card's quadratic-residue bit or the fixed point 1. No helper
 decrypts ciphertexts for the player who chose them. After the key reveal every
@@ -79,6 +81,58 @@ refuse to play across versions.
 A self-hosted router and managed hosting remain options for later deployment.
 The implementation does not modify a router or create external services.
 See [the implementation plan](WEBRTC_PLAN.md).
+
+## Play over Tor (relay mode)
+
+Tor Browser has no WebRTC, so it can't connect players directly. Instead the
+table server forwards the game messages, end-to-end encrypted, and nobody
+learns another player's IP address when everyone uses Tor. The page picks relay
+mode by itself when:
+
+- the browser has no `RTCPeerConnection` (Tor Browser), or
+- the page is served from an `.onion` address, or
+- the invite link says so (`m=relay`).
+
+In other browsers, **Network settings → Route game through the table server (no
+direct connections)** creates a relay table, for testing or for players who
+don't want to share IP addresses. STUN and TURN settings are hidden in relay
+mode because nothing uses them.
+
+A relay invite looks like `…/#room=<id>&k=<secret>&m=relay`. The part after `#`
+never reaches the server. `k` is a 32-byte random secret that authenticates the
+players' key exchange, so send the **whole** link privately; a link without it
+is refused as incomplete. Anyone who has the link and also controls the server
+could intercept the table, the same trust as WebRTC signaling.
+
+In Tor Browser, set the **Security Level to Standard** for the site: the card
+crypto runs in WebAssembly, which the Safer and Safest levels disable. The page
+says so if WebAssembly is missing.
+
+What the relay encryption gives you:
+
+- each pair of players agrees on fresh keys (ephemeral ECDH P-256, bound to the
+  invite secret, the table, both seats, all names and the relay mode by an
+  HMAC), then exchanges AES-GCM frames. The server sees only ciphertext,
+  sizes and timing;
+- forward secrecy: keys live only in the open tab, so a link leaked after the
+  game decrypts nothing;
+- the server can't reorder, drop, replay or alter messages, or switch a relay
+  table to WebRTC (which would reveal IP addresses), without the game noticing
+  and ending.
+
+It doesn't protect against a server that serves modified JavaScript or Wasm:
+the host serves the code. Among friends running their own table server that is
+the accepted trade-off.
+
+Keep the tab open and in front. **Reloading the page, or a phone suspending the
+tab for long, ends the game**: there is no rejoin. Short network hiccups are
+fine: the page reconnects its event stream and resumes where it left off. If a
+player has had no connection for 120 s, the server ends the table with
+"<name> lost connection". Restarting the server ends all tables.
+
+Over Tor each message takes about 0.4–1.4 s, so a deal takes several seconds
+plus the card crypto; card play feels normal. The page shows progress while
+keys are exchanged and cards are shuffled.
 
 ## Native app
 
@@ -129,6 +183,21 @@ and desktop/mobile layouts, and verifies leave propagation. It uses no WebRTC
 override or pasted connection details for the same-browser case.
 Set `TEST_WEBRTC=1` for automatic room setup across isolated browser profiles,
 or `TEST_MANUAL=1` to exercise the advanced manual setup.
+`--relay` (or `TEST_RELAY=1`) plays the same two rounds in relay mode across
+isolated profiles with `RTCPeerConnection` deleted, as in Tor Browser. It
+checks that every relay payload sent or received is a key frame or ciphertext,
+never a plaintext packet, then closes one tab and expects the others to end the
+game. Start the server with a short `P2SKAT_LIVENESS_MS` and pass the same value
+as `TEST_LIVENESS_MS` to also block that tab's leave request and test the
+server's liveness timeout. For the fault-injection runs, start the server with
+`P2SKAT_FAULT_LATENCY_MS=800,400` or `P2SKAT_FAULT_DROP_S=15` and raise the
+deadline with `TEST_DEADLINE_S=900`:
+
+```sh
+P2SKAT_FAULT_LATENCY_MS=800,400 P2SKAT_LIVENESS_MS=10000 target/debug/p2skat-room --bind 127.0.0.1:8793 &
+TEST_DEADLINE_S=900 TEST_LIVENESS_MS=10000 NODE_PATH=/tmp/p2skat-browser-test-tools/node_modules \
+  node scripts/browser-smoke.cjs --relay http://127.0.0.1:8793
+```
 Set `TEST_TURN_URL`, `TEST_TURN_USERNAME`, and `TEST_TURN_CREDENTIAL` to repeat it
 with relay-only connections; the test checks selected ICE candidates really use
 the relay. Remote/manual headless tests disable mDNS candidate masking because
