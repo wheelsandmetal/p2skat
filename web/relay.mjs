@@ -158,7 +158,8 @@ export class RelayUploader {
     this.inFlight = null;
     this.timer = null;
     this.failures = 0;
-    this.lastSuccess = now();
+    // When the current run of failed POSTs began; idle time before it is no outage.
+    this.failingSince = null;
     this.ackSent = 0;
     this.ackWanted = false;
     this.closed = false;
@@ -222,10 +223,12 @@ export class RelayUploader {
         if (batch.some(frame => this.queue.includes(frame))) throw new Error('The table server did not accept a message. The table has ended.');
         this.ackSent = Math.max(this.ackSent, ack);
         this.failures = 0;
-        this.lastSuccess = this.now();
+        this.failingSince = null;
         return this.pump(true);
       }
       if (status === 422 && data?.code === 'gap' && this.validExpected(data.expected)) {
+        this.failures = 0;
+        this.failingSince = null;
         // Only frames the server already has can be skipped; anything else it lost for good.
         const before = this.queue.length;
         this.confirm(data.expected);
@@ -264,7 +267,8 @@ export class RelayUploader {
 
   retry() {
     this.failures++;
-    if (this.now() - this.lastSuccess > this.giveUpMs) {
+    this.failingSince ??= this.now();
+    if (this.now() - this.failingSince > this.giveUpMs) {
       this.fail(new Error('Lost contact with the table server. The table has ended.'));
       return;
     }

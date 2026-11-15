@@ -419,6 +419,41 @@ test('terminal server errors end the table with the server message; a closed tab
   assert.deepEqual(later, ['This table has ended.']);
 });
 
+test('idle time before a failed POST is no outage; only a long run of failures is fatal', async () => {
+  let clock = 0;
+  let online = true;
+  const failures = [];
+  const calls = [];
+  const uploader = new RelayUploader({ lingerMs: 0, onFatal: error => failures.push(error.message), backoffMs: [1],
+    giveUpMs: 120000, now: () => clock,
+    post: async body => {
+      calls.push(body);
+      if (!online) throw new TypeError('offline');
+      return ok({ 1: body.frames.at(-1)?.seq + 1 || 1 });
+    } });
+  uploader.enqueue(frame(1, 1));
+  await waitFor(() => uploader.queue.length === 0);
+  // 121 s pass without anything to send, then one POST fails: retried, not fatal.
+  clock = 121000;
+  online = false;
+  uploader.enqueue(frame(1, 2));
+  await waitFor(() => calls.length >= 3);
+  assert.deepEqual(failures, []);
+  online = true;
+  await waitFor(() => uploader.queue.length === 0);
+  assert.deepEqual(failures, []);
+  // A continuous outage still ends the table once it lasts longer than giveUpMs.
+  online = false;
+  uploader.enqueue(frame(1, 3));
+  await waitFor(() => uploader.failures >= 2);
+  clock += 60000;
+  await settle(5);
+  assert.deepEqual(failures, [], 'a minute of failures is not yet fatal');
+  clock += 61000;
+  await waitFor(() => failures.length);
+  assert.match(failures[0], /Lost contact/);
+});
+
 test('the uploader gives up after a long outage, and sends ack-only POSTs on request', async () => {
   let clock = 0;
   const failures = [];
