@@ -67,7 +67,7 @@ pub trait Transport {
 pub trait Frontend {
     fn set_hand(&mut self, _hand: &[Card]) {}
     fn set_trick(&mut self, _trick: &Trick) {}
-    fn set_contract(&mut self, _contract: &Contract) {}
+    fn set_contract(&mut self, _contract: &Contract, _declarer: usize, _bid: u32) {}
     fn set_scores(&mut self, _scores: &[i32; 3]) {}
     fn set_trick_num(&mut self, _n: u32) {}
     fn set_round(&mut self, _n: u32) {}
@@ -286,7 +286,7 @@ impl<T: Transport> Session<T> {
             // === Bidding Phase ===
             state.phase = Phase::Bidding;
             state.bidding = BiddingState::new();
-            ui.show_status("=== Bidding ===")?;
+            ui.show_status("Bidding")?;
 
             let (winner_seat, final_bid) = self.bidding_phase(&mut state, ui).await?;
             state.declarer = Some(winner_seat);
@@ -300,7 +300,7 @@ impl<T: Transport> Session<T> {
                 .await?;
             state.contract = Some(contract);
             state.sort_hand();
-            ui.set_contract(&contract);
+            ui.set_contract(&contract, winner_seat.index(), final_bid);
             ui.set_hand(&state.hand);
 
             // === Playing Phase ===
@@ -802,7 +802,7 @@ impl<T: Transport> Session<T> {
                         );
                         validate_contract(&contract, !picked_up, bid)?;
                         ui.show_status(&format!(
-                            "{} declares {:?}{}",
+                            "{} declares {}{}",
                             self.names[declarer.index()],
                             gt,
                             if hand { " Hand" } else { "" }

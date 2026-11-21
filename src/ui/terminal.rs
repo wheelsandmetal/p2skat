@@ -716,7 +716,7 @@ impl crate::session::Frontend for TerminalUi {
     fn set_trick(&mut self, value: &Trick) {
         TerminalUi::set_trick(self, value);
     }
-    fn set_contract(&mut self, value: &Contract) {
+    fn set_contract(&mut self, value: &Contract, _declarer: usize, _bid: u32) {
         TerminalUi::set_contract(self, value);
     }
     fn set_scores(&mut self, value: &[i32; 3]) {

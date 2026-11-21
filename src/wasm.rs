@@ -329,8 +329,8 @@ impl Frontend for BrowserUi {
     fn set_trick(&mut self, trick: &Trick) {
         self.emit(json!({"type":"trick","cards":trick_json(trick)}));
     }
-    fn set_contract(&mut self, contract: &Contract) {
-        self.emit(json!({"type":"contract","contract":contract_json(contract)}));
+    fn set_contract(&mut self, contract: &Contract, declarer: usize, bid: u32) {
+        self.emit(json!({"type":"contract","contract":contract_json(contract),"declarer":declarer,"bid":bid}));
     }
     fn set_scores(&mut self, scores: &[i32; 3]) {
         self.emit(json!({"type":"scores","scores":scores}));

@@ -11,6 +11,16 @@ pub enum GameType {
     Null,
 }
 
+impl std::fmt::Display for GameType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GameType::Suit(suit) => write!(f, "{suit:?}"),
+            GameType::Grand => f.write_str("Grand"),
+            GameType::Null => f.write_str("Null"),
+        }
+    }
+}
+
 impl GameType {
     /// Base value for this game type (used in score calculation).
     pub fn base_value(self) -> u32 {
