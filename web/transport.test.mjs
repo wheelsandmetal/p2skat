@@ -11,7 +11,6 @@ test('static controls have unique DOM ids so network inputs cannot shadow table 
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]);
   assert.equal(new Set(ids).size, ids.length);
   assert.ok(ids.includes('turn-url'));
-  assert.ok(ids.includes('turn'));
 });
 
 test('messages received before Wasm is ready are retained and delivered in order', () => {

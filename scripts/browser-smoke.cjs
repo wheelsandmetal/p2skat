@@ -281,7 +281,7 @@ async function main() {
           await page.locator('#contract-type').selectOption(round === 1 ? 'grand' : 'null');
           await action('declare').click();
         } else if (choice.kind === 'card') {
-          assert.match(await page.locator('#turn').textContent(), /your turn/i);
+          assert.equal(await page.locator('.player.active[data-pos="self"]').count(), 1, 'Own seat is not marked as the active player');
           if (round === 1 && choice.trick_num === 1) await page.screenshot({ path: `/tmp/p2skat-playing-${seat}.png`, fullPage: true });
           await page.locator('#hand [data-card]:not(:disabled)').first().click({ position: { x: 10, y: 15 } });
         } else throw new Error(`Unknown choice ${choice.kind}`);

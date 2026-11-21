@@ -3,7 +3,10 @@ import { RoomClient, browserMarker } from './rooms.mjs';
 import { RelaySession, newInviteSecret, parseInviteSecret, relayInviteFragment } from './relay.mjs';
 
 const $ = id => document.getElementById(id);
-const ui = { seat: 0, names: [], hand: [], scores: [0, 0, 0], turn: null, choice: null, selected: new Set(), finished: false };
+const ui = {
+  seat: 0, names: [], hand: [], scores: [0, 0, 0], turn: null, choice: null, selected: new Set(), finished: false,
+  round: 1, trickNum: null, phase: 'Dealing', contract: null, declarer: null, bid: null, result: null,
+};
 let mesh = null;
 let worker = null;
 let room = null;
@@ -49,7 +52,6 @@ function stop(message, error = false) {
   $('actions').removeAttribute('data-kind');
   $('prompt-heading').textContent = 'Table ended';
   $('game-status').textContent = message;
-  $('turn').textContent = 'Table ended';
   $('leave').hidden = true;
   $('self-check').disabled = true;
   $('self-check-result').textContent = '';
@@ -420,6 +422,10 @@ const symbols = ['♦', '♥', '♠', '♣'];
 const ranks = ['7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
 const rankNames = ['Seven', 'Eight', 'Nine', 'Ten', 'Jack', 'Queen', 'King', 'Ace'];
 
+const positions = ['self', 'left', 'right'];
+const position = seat => positions[(seat - ui.seat + 3) % 3];
+const signed = value => value > 0 ? `+${value}` : value < 0 ? `−${-value}` : '0';
+
 function cardNode(id, button = false) {
   if (!Number.isInteger(id) || id < 1 || id > 32) throw new Error('The game supplied an invalid card.');
   const suit = Math.floor((id - 1) / 8);
@@ -428,11 +434,11 @@ function cardNode(id, button = false) {
   node.dataset.card = id;
   node.setAttribute('aria-label', `${rankNames[rank]} of ${suits[suit]}`);
   if (!button) node.setAttribute('role', 'img');
-  for (const [className, text] of [['rank', ranks[rank]], ['suit', symbols[suit]], ['rank-end', ranks[rank]]]) {
-    const part = element('span', className, text);
-    part.setAttribute('aria-hidden', 'true');
-    node.append(part);
-  }
+  const index = element('span', 'index');
+  index.append(element('span', '', ranks[rank]), element('span', '', symbols[suit]));
+  const pip = element('span', 'suit', symbols[suit]);
+  for (const part of [index, pip]) part.setAttribute('aria-hidden', 'true');
+  node.append(index, pip);
   return node;
 }
 
@@ -440,23 +446,27 @@ function renderPlayers() {
   $('players').replaceChildren(...ui.names.map((name, seat) => {
     const node = element('div', `player${ui.turn === seat ? ' active' : ''}`);
     node.dataset.seat = seat;
+    node.dataset.pos = position(seat);
     const avatar = element('span', 'player-avatar', `${seat + 1}`);
     avatar.setAttribute('aria-hidden', 'true');
-    const detail = element('div');
-    detail.append(element('div', 'player-name', `${name}${seat === ui.seat ? ' (you)' : ''}`), element('div', 'player-score', `${ui.scores[seat] > 0 ? '+' : ''}${ui.scores[seat]} points`));
+    const detail = element('div', 'player-detail');
+    const score = element('div', 'player-score', `${signed(ui.scores[seat])} points`);
+    if (ui.declarer === seat) score.prepend(element('span', 'player-role', 'Declarer'));
+    detail.append(element('div', 'player-name', `${name}${seat === ui.seat ? ' (you)' : ''}`), score);
     node.append(avatar, detail);
     return node;
   }));
 }
 
 function renderHand() {
+  const choice = ui.choice;
+  $('hand').dataset.mode = ui.finished ? '' : choice?.kind ?? '';
+  $('hand').style.setProperty('--count', Math.max(ui.hand.length, 2));
   $('hand').replaceChildren(...ui.hand.map(id => {
     const card = cardNode(id, true);
-    const choice = ui.choice;
     const discard = choice?.kind === 'discard';
     const legal = choice?.kind === 'card' && choice.legal.includes(id);
     card.disabled = ui.finished || !(discard || legal);
-    if (legal) card.classList.add('legal');
     if (discard) {
       card.setAttribute('aria-pressed', String(ui.selected.has(id)));
       card.classList.toggle('selected', ui.selected.has(id));
@@ -471,25 +481,45 @@ function renderHand() {
     } else if (legal) card.addEventListener('click', () => submit({ card: id }));
     return card;
   }));
-  $('hand-hint').textContent = ui.choice?.kind === 'discard' ? 'Choose two to discard' : ui.choice?.kind === 'card' ? 'Gold marks playable cards' : '';
 }
 
 function renderTrick(cards) {
   $('trick').replaceChildren(...cards.map(({ seat, card }) => {
     const play = element('div', 'trick-play');
-    play.append(element('span', '', ui.names[seat]), cardNode(card));
+    play.dataset.pos = position(seat);
+    const node = cardNode(card);
+    node.setAttribute('aria-label', `${ui.names[seat]}: ${node.getAttribute('aria-label')}`);
+    play.append(node);
     return play;
   }));
-  if (!cards.length) {
-    const empty = element('p', 'empty-trick', '♠');
-    empty.setAttribute('role', 'img');
-    empty.setAttribute('aria-label', 'No cards played');
-    $('trick').append(empty);
-  }
 }
 
-function renderContract(contract) {
-  $('contract').textContent = `${contract.game_type === 'suit' ? contract.trump : contract.game_type}${contract.hand ? ' · hand' : ''}`;
+function contractName({ game_type, trump, hand }) {
+  const name = game_type === 'suit' ? `${symbols[suits.indexOf(trump)]} ${trump[0].toUpperCase()}${trump.slice(1)}` : game_type === 'grand' ? 'Grand' : 'Null';
+  return `${name}${hand ? ' · Hand' : ''}`;
+}
+
+function renderMeta() {
+  $('round').textContent = `Round ${ui.round}${ui.trickNum ? ` · Trick ${ui.trickNum} / 10` : ''}`;
+  $('contract').textContent = ui.contract ? contractName(ui.contract) : ui.phase;
+  $('contract-detail').textContent = ui.declarer === null ? '' : `${ui.names[ui.declarer]} declares at ${ui.bid}`;
+  const result = ui.result;
+  $('round-result').hidden = !result;
+  $('trick').hidden = Boolean(result);
+  if (!result) return;
+  const won = result.value > 0;
+  const detail = ui.contract?.game_type === 'null' ? (won ? 'Took no tricks.' : 'Took a trick.') : `${result.points} of 120 card points.`;
+  $('round-result').replaceChildren(
+    element('span', 'eyebrow', `Round ${ui.round} result`),
+    element('strong', 'round-result-title', `${result.declarer} ${won ? 'wins' : 'loses'}`),
+    element('span', `round-result-value${won ? '' : ' lost'}`, signed(result.value)),
+    element('p', '', detail),
+  );
+}
+
+function waitingHeading() {
+  if (ui.turn === null) return 'At the table';
+  return ui.turn === ui.seat ? 'Your turn' : `${ui.names[ui.turn]}’s turn`;
 }
 
 function submit(action) {
@@ -517,10 +547,12 @@ function renderChoice(choice) {
   ui.selected.clear();
   if (choice.hand) ui.hand = choice.hand;
   if (choice.trick) renderTrick(choice.trick);
-  if (choice.contract) renderContract(choice.contract);
-  if (choice.trick_num) $('trick-num').textContent = `Trick ${choice.trick_num} / 10`;
+  if (choice.contract) ui.contract = choice.contract;
+  if (choice.trick_num) ui.trickNum = choice.trick_num;
+  if (choice.kind === 'bid') ui.phase = 'Bidding';
+  if (['pickup', 'discard', 'contract'].includes(choice.kind)) ui.phase = 'Naming the game';
   ui.turn = choice.kind === 'continue' ? null : ui.seat;
-  $('turn').textContent = choice.kind === 'continue' ? 'Round complete' : 'Your turn';
+  renderMeta();
   renderPlayers();
   const actions = $('actions');
   actions.replaceChildren();
@@ -550,7 +582,7 @@ function renderChoice(choice) {
     actions.append(count, button);
   } else if (choice.kind === 'contract') {
     $('prompt-heading').textContent = 'Name your game';
-    $('game-status').textContent = `Bid ${choice.bid}${choice.is_hand ? ' · Hand' : ''}`;
+    $('game-status').textContent = `You won the bidding at ${choice.bid}${choice.is_hand ? ' · Hand' : ''}.`;
     const form = element('form');
     const label = element('label', '', 'Game');
     const type = element('select');
@@ -585,10 +617,10 @@ function renderChoice(choice) {
     actions.append(form);
   } else if (choice.kind === 'card') {
     $('prompt-heading').textContent = 'Play a card';
-    $('game-status').textContent = 'Follow suit when you can.';
+    $('game-status').textContent = 'Raised cards are playable. Follow suit when you can.';
   } else if (choice.kind === 'continue') {
     $('prompt-heading').textContent = 'Another round?';
-    $('game-status').textContent = 'Everyone agrees to deal again.';
+    $('game-status').textContent = 'The next deal starts when all three agree.';
     buttons.append(actionButton('Next round', 'continue', { continue: true }, true), actionButton('Finish game', 'finish', { continue: false }));
   } else throw new Error('Unknown game choice.');
   if (buttons.children.length) actions.append(buttons);
@@ -600,21 +632,26 @@ function renderChoice(choice) {
 function renderEvent(event) {
   if (event.type === 'ready') return;
   if (event.type === 'choice') renderChoice(event);
-  else if (event.type === 'hand') { ui.hand = event.cards; renderHand(); }
-  else if (event.type === 'turn') {
+  else if (event.type === 'hand') {
+    ui.hand = event.cards;
+    if (!ui.contract) { ui.phase = 'Bidding'; renderMeta(); }
+    renderHand();
+  } else if (event.type === 'turn') {
     ui.turn = event.seat;
-    $('turn').textContent = event.seat === ui.seat ? 'Your turn' : `${ui.names[event.seat]}’s turn`;
+    if (!ui.choice) $('prompt-heading').textContent = waitingHeading();
     renderPlayers();
   } else if (event.type === 'trick') renderTrick(event.cards);
-  else if (event.type === 'contract') renderContract(event.contract);
-  else if (event.type === 'scores') { ui.scores = event.scores; renderPlayers(); }
-  else if (event.type === 'trick_num') $('trick-num').textContent = `Trick ${event.number} / 10`;
+  else if (event.type === 'contract') {
+    ui.contract = event.contract;
+    ui.declarer = event.declarer;
+    ui.bid = event.bid;
+    renderMeta();
+    renderPlayers();
+  } else if (event.type === 'scores') { ui.scores = event.scores; renderPlayers(); }
+  else if (event.type === 'trick_num') { ui.trickNum = event.number; renderMeta(); }
   else if (event.type === 'round') {
-    $('round').textContent = `Round ${event.number}`;
-    $('contract').textContent = 'Dealing';
-    $('trick-num').textContent = 'Trick — / 10';
-    ui.hand = [];
-    ui.turn = null;
+    Object.assign(ui, { round: event.number, trickNum: null, phase: 'Dealing', contract: null, declarer: null, bid: null, result: null, hand: [], turn: null });
+    renderMeta();
     renderHand();
     renderPlayers();
     renderTrick([]);
@@ -622,7 +659,7 @@ function renderEvent(event) {
   } else if (event.type === 'status') {
     if (relay && /^Shuffling/.test(event.message)) event = { ...event, message: shuffleText };
     $('game-status').textContent = event.message;
-    if (!ui.choice) $('prompt-heading').textContent = 'At the table';
+    if (!ui.choice) $('prompt-heading').textContent = waitingHeading();
     note(event.message);
   } else if (event.type === 'bid') {
     note(`${event.name} ${event.action === 'bid' ? `bids ${event.value}` : event.action === 'hold' ? 'holds' : 'passes'}.`);
@@ -630,10 +667,10 @@ function renderEvent(event) {
   else if (event.type === 'round_result') {
     ui.scores = event.scores;
     ui.turn = null;
-    $('turn').textContent = 'Round complete';
+    ui.result = { declarer: event.declarer, value: event.value, points: event.points };
+    renderMeta();
     renderPlayers();
-    const result = `${event.declarer}: ${event.value >= 0 ? '+' : ''}${event.value} · ${event.points} card points.`;
-    note(result);
-    status(`Round verified. ${result}`);
+    note(`${event.declarer}: ${signed(event.value)} · ${event.points} card points.`);
+    status('Round verified by all three players.');
   }
 }
